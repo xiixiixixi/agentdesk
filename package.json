@@ -1,20 +1,20 @@
 {
-  "name": "chrome-agent-browser",
-  "version": "0.5.5",
-  "description": "Let MCP agents drive your real Chromium-family browser (with your logged-in sessions): extension + native host + local service, one-command setup",
+  "name": "agentdesk",
+  "version": "1.0.0",
+  "description": "Let MCP agents drive your real Chromium-family browser (with your logged-in sessions) AND your screen (windows, AX elements, clicks, typing, screenshots): extension + native host + local service + CUA Helper app, one-command setup",
   "type": "module",
   "engines": {
     "node": ">=18"
   },
   "bin": {
-    "chrome-agent-browser": "setup.mjs",
-    "chrome-agent-browser-mcp": "service/mcp-entry.mjs",
-    "chrome-agent-browser-doctor": "doctor.mjs",
-    "chrome-agent-browser-uninstall": "uninstall.mjs"
+    "agentdesk": "setup.mjs",
+    "agentdesk-mcp": "service/mcp-entry.mjs",
+    "agentdesk-doctor": "doctor.mjs",
+    "agentdesk-uninstall": "uninstall.mjs"
   },
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "check": "node --check host/host.mjs && node --check service/service.mjs && node --check installer/install.mjs && node --check service/locator.mjs && node --check service/api.mjs && node --check service/mcp.mjs && node --check service/audit.mjs && node --check service/cua.mjs && node --check service/cua-guide.mjs && node --check cua-selftest.mjs && node --check setup.mjs && node --check verify.mjs && node --check service/login.mjs && node --check service/credentials.mjs && node --check service/totp.mjs && node --check credential.mjs",
+    "check": "node --check host/host.mjs && node --check service/service.mjs && node --check installer/install.mjs && node --check service/locator.mjs && node --check service/api.mjs && node --check service/mcp.mjs && node --check service/audit.mjs && node --check service/cua.mjs && node --check service/cua-app.mjs && node --check service/cua-guide.mjs && node --check cua-selftest.mjs && node --check setup.mjs && node --check verify.mjs && node --check service/login.mjs && node --check service/credentials.mjs && node --check service/totp.mjs && node --check credential.mjs",
     "e2e": "node test/e2e/run-e2e.mjs",
     "verify": "node verify.mjs",
     "selftest": "node service/service.mjs --selftest && node service/mcp-entry.mjs --help || true",
@@ -31,6 +31,7 @@
     "@modelcontextprotocol/sdk": "^1.0.0"
   },
   "files": [
+    "assets/",
     "extension/",
     "host/host.mjs",
     "installer/",
@@ -48,16 +49,17 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/xiixiixixi/chrome-agent-browser.git"
+    "url": "git+https://github.com/xiixiixixi/agentdesk.git"
   },
-  "homepage": "https://github.com/xiixiixixi/chrome-agent-browser#readme",
+  "homepage": "https://github.com/xiixiixixi/agentdesk#readme",
   "bugs": {
-    "url": "https://github.com/xiixiixixi/chrome-agent-browser/issues"
+    "url": "https://github.com/xiixiixixi/agentdesk/issues"
   },
   "license": "MIT",
   "keywords": [
     "mcp",
     "browser-automation",
+    "computer-use",
     "chrome",
     "chromium",
     "arc",

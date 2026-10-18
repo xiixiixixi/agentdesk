@@ -7,8 +7,10 @@
 //
 // 命令集（与 service/cua.mjs 的调用侧一一对应）：
 //   probe                              → {axGranted, screenGranted}（AXIsProcessTrusted / CGPreflightScreenCaptureAccess）
-//                                        附 responsibleProcess（TCC 记账的宿主 App 名，通常为终端——
-//                                        用户在系统设置里要勾选的就是这个名字；沿 ppid 链推断）
+//                                        附 responsibleProcess（TCC 记账的宿主 App 名——用户在系统设置
+//                                        里要勾选的就是这个名字）。v1.0.0：从 CUA Helper.app 内运行时
+//                                        权限挂在本 .app 上（helperBundle 回传 id/name/path，终端是谁
+//                                        不再重要）；裸 CLI 运行时沿 ppid 链推断宿主（通常为终端）。
 //   request-permissions                → 向系统申请辅助功能与屏幕录制权限（各自仅在缺失时申请）：
 //                                        AXIsProcessTrustedWithOptions(kAXTrustedCheckOptionPrompt=true)
 //                                        弹标准对话框并把负责进程加进辅助功能列表（未勾选）；
@@ -42,14 +44,24 @@
 //   overlay-hide                       → 立即隐藏叠加 → {ok:true}
 //   show-permission-card {kind:'accessibility'|'screen', appName, durationSec?(默认120,夹取5..600)}
 //                                       → {kind, autoHideSec, frame:{x,y,w,h}(屏幕左上原点), dragFrom?}
-//                                       权限引导悬浮卡片（v0.5.4）：NSPanel(borderless/nonactivating/
-//                                       floating/canJoinAllSpaces)。本项目唯一「可交互」的叠加窗
-//                                       （ignoresMouseEvents=false，但它就是给用户看的引导 UI；仍不抢
-//                                       焦点）：拖卡片背景=挪位置；左侧琥珀图标=拖拽句柄，按住可把
-//                                       「负责进程的 .app bundle」（TCC 记账、设置列表要加的正是它）
-//                                       作为文件拖进系统设置的权限列表（NSDraggingSource 文件拖拽）；
-//                                       右上 ✕ 关闭；durationSec 秒后自动淡出。accessibility 在上、
-//                                       screen 在下错位排布，两卡不重叠。
+//                                       权限引导悬浮卡片（v0.5.4 起；v1.0.0 全面升级）：
+//                                       NSPanel(borderless/nonactivating/floating/canJoinAllSpaces)。
+//                                       本项目唯一「可交互」的叠加窗（ignoresMouseEvents=false，
+//                                       但它就是给用户看的引导 UI；仍不抢焦点）。
+//                                       v1.0.0 形态（560×124）：
+//                                       ① 左侧 72px 琥珀大图标=拖拽句柄——从 CUA Helper.app 内运行时
+//                                          拖出的就是本 .app 本体（TCC 记账、设置列表要加的正是它）；
+//                                          裸 CLI 运行时退化为拖负责进程（终端）的 .app；
+//                                       ② 贴靠跟随：150ms 轮询 CGWindowListCopyWindowInfo 找系统设置
+//                                          窗口（pid → bundleIdentifier == com.apple.systempreferences
+//                                          取面积最大者），卡片水平居中于它、贴其下沿上叠 6px，
+//                                          设置窗移动卡片跟随；用户拖动卡片/图标拖拽期间冻结跟随；
+//                                       ③ 授权自动检测：1.2s 轮询 AXIsProcessTrusted（不带 prompt）/
+//                                          CGPreflightScreenCaptureAccess，对应权限生效即自动隐藏该卡；
+//                                          卡片全数收起且 stdin 已 EOF 时进程自退（下次请求由服务端
+//                                          从 .app 位置重启新实例=自动重读 TCC grant）；
+//                                       ④ 右上 ✕ 关闭；durationSec 秒后自动淡出；accessibility 在上、
+//                                          screen 在下错位排布，两卡不重叠。
 //   hide-permission-card {kind}        → 立即隐藏对应卡片（幂等，未显示的 kind 也回 ok）
 //
 // 线程模型（v0.5.1 起）：主线程跑 NSApplication run loop（叠加窗口需要 AppKit）；
@@ -119,6 +131,14 @@ let AX_NOT_GRANTED_HINT = "辅助功能（AX）未授权：系统设置 → 隐�
 func cmdProbe(_ id: Any?, _ p: [String: Any]) {
     var out: [String: Any] = ["axGranted": axTrusted(), "screenGranted": CGPreflightScreenCaptureAccess(),
                               "responsibleProcess": responsibleProcessName()]
+    // v1.0.0：从 .app 内运行 → 权限主体就是本 .app（服务端据此切换为「拖 .app 授权」引导）
+    if let bid = Bundle.main.bundleIdentifier {
+        out["helperBundle"] = [
+            "id": bid,
+            "name": (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? "CUA Helper",
+            "path": Bundle.main.bundleURL.path,
+        ] as [String: Any]
+    }
     let b = CGDisplayBounds(CGMainDisplayID()) // 主屏尺寸（自检把幽魂光标定位到屏幕中央用）
     out["screen"] = ["w": b.width, "h": b.height]
     respondOk(id, out)
@@ -136,12 +156,16 @@ func parentPid(_ pid: pid_t) -> pid_t {
 }
 
 /**
- * 负责进程名（TCC 记账的宿主 App，从终端跑时就是终端）：沿 ppid 链向上找最近的真 App
- * 进程（NSRunningApplication 非 nil 且带 bundleIdentifier 的才算——主线程的 NSApplication
- * 会把本 CLI 进程也注册成「app」，但无 bundle，借此排除）；找不到回退本进程名。
- * 申请权限时系统弹窗与设置列表里显示的就是这个名字——用户要勾选的也是它。
+ * 负责进程名（TCC 记账的宿主 App——申请权限时系统弹窗与设置列表里显示的就是它）。
+ * v1.0.0 双模式：从 CUA Helper.app 内运行（Bundle.main 带 bundleIdentifier）→ 就是本 .app；
+ * 裸 CLI 运行 → 沿 ppid 链向上找最近的真 App 进程（NSRunningApplication 非 nil 且带
+ * bundleIdentifier 的才算——主线程的 NSApplication 会把本 CLI 进程也注册成「app」，
+ * 但无 bundle，借此排除）；找不到回退本进程名。
  */
 func responsibleProcessName() -> String {
+    if Bundle.main.bundleIdentifier != nil { // 本进程已是个 .app：权限挂在自己身上
+        return (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? "CUA Helper"
+    }
     var pid = parentPid(getpid()) // 从父进程起步，跳过被 NSApplication 自注册的本进程
     for _ in 0..<16 { // 链深兜底，防异常成环
         if pid <= 1 { break }
@@ -775,14 +799,19 @@ func cmdOverlayHide(_ id: Any?) {
     }
 }
 
-// ---------- 权限引导悬浮卡片（v0.5.4：可拖拽/可交互的引导 UI；照抄成熟 macOS 工具的授权引导模式） ----------
+// ---------- 权限引导悬浮卡片（v0.5.4 起；v1.0.0 升级：560×124 大卡 + 贴靠系统设置 + 拖 .app 授权 + 授权自动检测） ----------
 
-let CARD_W: CGFloat = 300
-let CARD_H: CGFloat = 116
+let CARD_W: CGFloat = 560
+let CARD_H: CGFloat = 124
 let CARD_GAP: CGFloat = 20 // 双卡同屏时的纵向错位间距（accessibility 在上、screen 在下）
+let SETTINGS_BUNDLE_ID = "com.apple.systempreferences" // 系统设置（bundleId 跨语言稳定；ownerName 会本地化）
+let CARD_FOLLOW_INTERVAL: TimeInterval = 0.15 // 贴靠跟随轮询：150ms
+let CARD_GRANT_WATCH_INTERVAL: TimeInterval = 1.2 // 授权自动检测轮询（AXIsProcessTrusted 不带 prompt）
 
-/** 负责进程的 .app bundle 路径（拖拽句柄 promise 它——TCC 记账、设置列表要加的正是这个 App）。 */
+/** 负责进程的 .app bundle 路径（拖拽句柄 promise 它——TCC 记账、设置列表要加的正是这个 App）。
+ *  v1.0.0：从 CUA Helper.app 内运行时拖出的就是本 .app 本体；裸 CLI 运行走 ppid 链（终端）。 */
 func responsibleAppBundleURL() -> URL? {
+    if Bundle.main.bundleIdentifier != nil { return Bundle.main.bundleURL } // 本进程就是持权 .app
     var pid = parentPid(getpid()) // 与 responsibleProcessName() 同一条 ppid 链
     for _ in 0..<16 {
         if pid <= 1 { break }
@@ -820,13 +849,16 @@ final class CardCloseButton: NSView {
 }
 
 /**
- * 左侧琥珀图标 = 拖拽句柄：按住它发起一次文件拖拽，拖出的就是「负责进程的 .app bundle」——
- * 用户直接把它放进系统设置 → 隐私与安全性 → 辅助功能/屏幕录制 的列表里（macOS 对拖入的
- * App 自动建 TCC 条目，效果等同点 + 号再选 App）。fileURL 为 nil（父链上找不到带 bundle 的
- * App）时鼠标事件交还父视图，句柄区退化为窗口拖动。
+ * 左侧琥珀大图标 = 拖拽句柄（v1.0.0：72px 大 tile）：按住它发起一次文件拖拽，拖出的就是
+ * 「持权 .app」——从 CUA Helper.app 内运行时是本 .app 本体，裸 CLI 时是负责进程（终端）的
+ * .app bundle。用户直接把它放进系统设置 → 隐私与安全性 → 辅助功能/屏幕录制 的列表里
+ * （macOS 对拖入的 App 自动建 TCC 条目，效果等同点 + 号再选 App）。fileURL 为 nil（两处都
+ * 找不到 .app）时鼠标事件交还父视图，句柄区退化为窗口拖动。拖拽期间经 onDragStateChange
+ * 通知控制器冻结贴靠跟随（防卡片追着鼠标跑）。
  */
 final class CardIconDragView: NSView, NSDraggingSource {
     var fileURL: URL?
+    var onDragStateChange: ((Bool) -> Void)?
 
     override var isFlipped: Bool { true }
 
@@ -835,18 +867,19 @@ final class CardIconDragView: NSView, NSDraggingSource {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        // 琥珀圆 + 白描边（与扩展角标/幽灵光标同色系）
+        // 琥珀圆 + 白描边（与扩展角标/幽灵光标/App 图标同色系）
         let circle = NSBezierPath(ovalIn: bounds.insetBy(dx: 2.5, dy: 2.5))
         AMBER.setFill()
         circle.fill()
         NSColor.white.withAlphaComponent(0.85).setStroke()
-        circle.lineWidth = 1.5
+        circle.lineWidth = 2
         circle.stroke()
-        // 圆心内嵌小箭头（幽灵光标的品牌符号，热区在左上的箭头形）
+        // 圆心内嵌大箭头（幽灵光标的品牌符号，热区在左上的箭头形；随 tile 尺寸缩放）
         let c = NSPoint(x: bounds.midX, y: bounds.midY)
+        let s = bounds.width / 72 // 以 72px 基准设计稿等比缩放
         let path = NSBezierPath()
         for (i, pt) in ARROW_POINTS.enumerated() {
-            let p = NSPoint(x: c.x - 6.4 + pt.x * 1.05, y: c.y - 10.3 + pt.y * 1.05)
+            let p = NSPoint(x: c.x - 6.4 * s + pt.x * 1.05 * s, y: c.y - 10.3 * s + pt.y * 1.05 * s)
             if i == 0 { path.move(to: p) } else { path.line(to: p) }
         }
         path.close()
@@ -856,12 +889,18 @@ final class CardIconDragView: NSView, NSDraggingSource {
 
     override func mouseDown(with event: NSEvent) {
         guard let url = fileURL else { super.mouseDown(with: event); return } // 无可拖对象：退回窗口移动
+        onDragStateChange?(true) // 冻结贴靠跟随：拖拽进行中卡片不得追着鼠标跑
         let pb = NSPasteboard()
         pb.clearContents()
         pb.writeObjects([url as NSURL]) // 磁盘上已存在的 .app：文件 URL 直拖（无需 NSFilePromiseProvider 的惰性承诺）
         let item = NSDraggingItem(pasteboardWriter: url as NSURL)
         item.setDraggingFrame(bounds, contents: snapshotImage())
         beginDraggingSession(with: [item], event: event, source: self)
+    }
+
+    /** 拖拽结束（无论 drop 在哪）：解除贴靠冻结。 */
+    func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        onDragStateChange?(false)
     }
 
     /** 拖拽随行图像：把自己画进离屏 NSImage（CG 上下文翻转一次，与 flipped 绘制同向）。 */
@@ -880,10 +919,12 @@ final class CardIconDragView: NSView, NSDraggingSource {
     func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation { .copy }
 }
 
-/** 卡片内容视图：深色圆角底 + 琥珀描边；标题/主文案/副文案三行（图标句柄与 ✕ 为子视图）。 */
+/** 卡片内容视图（v1.0.0：560×124）：深色圆角底 + 琥珀描边；产品名/指引/负责进程三行文案。
+ *  用户拖动卡片背景（isMovableByWindowBackground）→ onUserMove → 该卡停止自动贴靠。 */
 class PermissionCardView: NSView {
-    let kind: String // accessibility | screen（决定主文案指向哪个列表）
-    var appName = "" { didSet { needsDisplay = true } } // 副文案里要勾选的终端名
+    let kind: String // accessibility | screen（决定指引指向哪个列表）
+    var appName = "" { didSet { needsDisplay = true } } // 负责进程名（bundled 运行时=CUA Helper）
+    var onUserMove: (() -> Void)? // 用户手动挪卡：停止贴靠跟随
 
     init(frame frameRect: NSRect, kind: String) {
         self.kind = kind
@@ -894,25 +935,31 @@ class PermissionCardView: NSView {
 
     override var isFlipped: Bool { true }
 
+    override func mouseDown(with event: NSEvent) {
+        onUserMove?() // 用户要自己挪：停贴靠（再交还系统完成窗口拖动）
+        super.mouseDown(with: event)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
-        let bg = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 14, yRadius: 14)
+        let bg = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 16, yRadius: 16)
         NSColor(white: 0.12, alpha: 0.97).setFill() // 近黑底：浅色/深色外观下都衬得住琥珀描边
         bg.fill()
         AMBER.withAlphaComponent(0.9).setStroke()
         bg.lineWidth = 1.5
         bg.stroke()
 
-        let textX: CGFloat = 76
-        let textW = bounds.width - textX - 12
-        drawText("Chrome Agent Browser",
-                 in: NSRect(x: textX, y: 20, width: textW, height: 18),
-                 [.font: NSFont.boldSystemFont(ofSize: 12.5), .foregroundColor: NSColor.white])
-        drawText(kind == "accessibility" ? "拖我到上面的辅助功能列表" : "拖我到上面的屏幕录制列表",
-                 in: NSRect(x: textX, y: 42, width: textW, height: 18),
-                 [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.white])
-        let name = appName.isEmpty ? "运行本命令的终端" : appName
-        drawText("或点列表下方的 + 号 → 选「\(name)」",
-                 in: NSRect(x: textX, y: 63, width: textW, height: 16),
+        // 文案区：左侧 72px 图标 tile（x 18..90）+ 14 间距；右侧给 ✕ 留 44px
+        let textX: CGFloat = 104
+        let textW = bounds.width - textX - 44
+        drawText("AgentDesk",
+                 in: NSRect(x: textX, y: 22, width: textW, height: 20),
+                 [.font: NSFont.boldSystemFont(ofSize: 14), .foregroundColor: NSColor.white])
+        drawText(kind == "accessibility" ? "把左边的图标拖进上面的「辅助功能」列表" : "把左边的图标拖进上面的「屏幕录制」列表",
+                 in: NSRect(x: textX, y: 50, width: textW, height: 18),
+                 [.font: NSFont.systemFont(ofSize: 12.5), .foregroundColor: NSColor.white])
+        let name = appName.isEmpty ? "CUA Helper" : appName
+        drawText("松手即完成授权（也可点列表下方的 + 号选「\(name)」）",
+                 in: NSRect(x: textX, y: 78, width: textW, height: 16),
                  [.font: NSFont.systemFont(ofSize: 10.5), .foregroundColor: NSColor.white.withAlphaComponent(0.62)])
     }
 
@@ -924,12 +971,13 @@ class PermissionCardView: NSView {
     }
 }
 
-/** 一张卡片 = 面板 + 内容视图 + 淡出定时器。 */
+/** 一张卡片 = 面板 + 内容视图 + 淡出定时器 + 贴靠开关。 */
 final class CardEntry {
     let kind: String
     let panel: NSPanel
     let view: PermissionCardView
     var fadeItem: DispatchWorkItem?
+    var followsSettings = true // 用户没手动挪过 → 自动贴靠系统设置窗口
 
     init(kind: String, panel: NSPanel, view: PermissionCardView) {
         self.kind = kind
@@ -940,11 +988,20 @@ final class CardEntry {
 
 /**
  * 权限引导卡片控制器：按 kind 管理至多两张卡片（accessibility/screen），可并存、错位不重叠。
+ * v1.0.0 新增两组常驻轮询（有卡片在屏才开，全收即停）：
+ *   ① 贴靠跟随（150ms）：CGWindowListCopyWindowInfo 找系统设置窗口（无需任何权限），卡片
+ *      水平居中于它、贴其下沿上叠 6px，设置窗移动卡片跟随；图标拖拽期间/用户手动挪卡后停止；
+ *   ② 授权自动检测（1.2s）：AXIsProcessTrusted（不带 prompt）/ CGPreflightScreenCaptureAccess
+ *      轮询，对应权限生效即自动隐藏该卡；卡片全数收起且 stdin 已 EOF → 进程自退（服务端下次
+ *      请求自动从 .app 位置重启新实例 = 重读 TCC grant，用户零操作）。
  * 仅主线程调用（命令分发处保证）。失败安全：任何路径只影响自身卡片，不影响主命令循环。
  */
 final class PermissionCardController {
     private var cards: [String: CardEntry] = [:]
     private var exitAfterCardsClose = false // stdin 已 EOF 但卡片还在：等最后一张收起再退进程
+    private var followTimer: Timer?
+    private var grantTimer: Timer?
+    private var freezeFollow = false // 图标文件拖拽进行中：冻结贴靠（防卡片追着鼠标跑）
 
     var hasVisibleCards: Bool { !cards.isEmpty }
 
@@ -953,6 +1010,7 @@ final class PermissionCardController {
         if let entry = cards[kind] {
             entry.view.appName = appName
             scheduleFade(entry, durationSec)
+            syncWatchers()
             return reply(entry, durationSec: durationSec)
         }
         let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: CARD_W, height: CARD_H),
@@ -970,20 +1028,25 @@ final class PermissionCardController {
         view.appName = appName
         panel.contentView = view
 
-        let icon = CardIconDragView(frame: NSRect(x: 14, y: 30, width: 52, height: 52))
+        let icon = CardIconDragView(frame: NSRect(x: 18, y: (CARD_H - 72) / 2, width: 72, height: 72))
         icon.fileURL = dragURL
+        icon.onDragStateChange = { [weak self] on in self?.freezeFollow = on }
         view.addSubview(icon)
-        let close = CardCloseButton(frame: NSRect(x: CARD_W - 26, y: 8, width: 18, height: 18))
+        let close = CardCloseButton(frame: NSRect(x: CARD_W - 30, y: 10, width: 20, height: 20))
         view.addSubview(close)
 
         let entry = CardEntry(kind: kind, panel: panel, view: view)
+        view.onUserMove = { [weak self, weak view] in
+            guard let self, let view else { return }
+            self.cards[view.kind]?.followsSettings = false // 用户接管位置：这张卡停止贴靠
+        }
         close.onClick = { [weak self] in
             self?.hide(kind: kind)
             self?.exitIfDone()
         }
         cards[kind] = entry
 
-        // 默认位置：主屏中央偏右（系统设置通常开在左半屏/居中）；screen 卡在 accessibility 卡下方错开
+        // 初始兜底位（无系统设置窗时停留于此）：主屏中央偏右；screen 卡在 accessibility 卡下方错开
         let vis = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let slot: CGFloat = kind == "accessibility" ? 0 : 1
         let x = vis.midX + vis.width * 0.12 - CARD_W / 2
@@ -991,6 +1054,8 @@ final class PermissionCardController {
         panel.setFrameOrigin(NSPoint(x: x, y: y))
         panel.orderFrontRegardless() // 显示但绝不 activate（不抢系统设置的焦点）
         scheduleFade(entry, durationSec)
+        syncWatchers()
+        repositionCards() // 系统设置窗已开则立即贴上去（不等第一个 150ms 节拍）
         return reply(entry, durationSec: durationSec)
     }
 
@@ -1001,6 +1066,7 @@ final class PermissionCardController {
         entry.fadeItem = nil
         cards[kind] = nil
         entry.panel.orderOut(nil)
+        syncWatchers()
     }
 
     /** stdin EOF 时的退出决策：无卡片立即退（旧行为）；有卡片留守，收齐后由 exitIfDone 收尾。 */
@@ -1016,7 +1082,93 @@ final class PermissionCardController {
     func exitIfDone() {
         guard exitAfterCardsClose, cards.isEmpty else { return }
         exitAfterCardsClose = false
+        stopWatchers()
         NSApp.terminate(nil)
+    }
+
+    // ---- 贴靠跟随（150ms 轮询；窗口清单本身无需任何授权） ----
+
+    /** 系统设置窗口（屏上、常规层、bundleId 匹配者中面积最大）；无则 nil。 */
+    private func systemSettingsWindow() -> CGRect? {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+          as? [[String: Any]] else { return nil }
+        var best: CGRect?
+        var bestArea: CGFloat = 0
+        for w in list {
+            let layer = (w[kCGWindowLayer as String] as? Int) ?? -1
+            let pid = (w[kCGWindowOwnerPID as String] as? Int) ?? 0
+            guard layer == 0, pid > 0 else { continue }
+            guard NSRunningApplication(processIdentifier: pid_t(pid))?.bundleIdentifier == SETTINGS_BUNDLE_ID else { continue }
+            guard let b = w[kCGWindowBounds as String] as? [String: Any] else { continue }
+            let r = CGRect(x: (b["X"] as? Double) ?? 0, y: (b["Y"] as? Double) ?? 0,
+                           width: (b["Width"] as? Double) ?? 0, height: (b["Height"] as? Double) ?? 0)
+            let area = r.width * r.height
+            if area > bestArea { bestArea = area; best = r }
+        }
+        return best
+    }
+
+    /** 按 kind 重摆所有「未被动过」的卡片：水平居中于设置窗、贴其下沿上叠 6px（screen 卡再下移错开）。 */
+    private func repositionCards() {
+        guard !freezeFollow else { return }
+        guard let s = systemSettingsWindow() else { return } // 无设置窗：停在兜底位
+        let mainMaxY = NSScreen.main?.frame.maxY ?? 0
+        for kind in ["accessibility", "screen"] {
+            guard let entry = cards[kind], entry.followsSettings else { continue }
+            let slot: CGFloat = kind == "accessibility" ? 0 : 1
+            let cgTopLeftY = s.maxY - 6 // 贴设置窗下沿，上叠 6px（CG 左上原点）
+            let originY = mainMaxY - cgTopLeftY - CARD_H - slot * (CARD_H + CARD_GAP) // → AppKit 左下原点
+            var f = NSRect(x: s.midX - CARD_W / 2, y: originY, width: CARD_W, height: CARD_H)
+            f = clampToVisibleFrame(f, settings: s, mainMaxY: mainMaxY)
+            entry.panel.setFrameOrigin(f.origin)
+        }
+    }
+
+    /** 夹进设置窗所在显示器的工作区（防多屏/贴边时卡片出屏）。 */
+    private func clampToVisibleFrame(_ f: NSRect, settings s: CGRect, mainMaxY: CGFloat) -> NSRect {
+        let centerAppKit = NSPoint(x: s.midX, y: mainMaxY - s.midY) // CG → AppKit 纵轴换算
+        let screen = NSScreen.screens.first { NSPointInRect(centerAppKit, $0.frame) } ?? NSScreen.main
+        guard let vis = screen?.visibleFrame, vis.width >= f.width else { return f }
+        var r = f
+        r.origin.x = min(max(r.origin.x, vis.minX), vis.maxX - r.width)
+        r.origin.y = min(max(r.origin.y, vis.minY), vis.maxY - r.height)
+        return r
+    }
+
+    // ---- 授权自动检测（1.2s 轮询；状态查询一律不带 prompt） ----
+
+    private func checkGrants() {
+        var granted: [String] = []
+        if cards["accessibility"] != nil, axTrusted() { granted.append("accessibility") }
+        if cards["screen"] != nil, CGPreflightScreenCaptureAccess() { granted.append("screen") }
+        for k in granted { hide(kind: k) } // 权限生效 → 对应卡片使命完成，自动收起
+        if !granted.isEmpty { exitIfDone() } // 非交互留卡场景：全收齐即自退（服务端下次请求自动重启）
+    }
+
+    // ---- 轮询的启停（有卡才转，无卡全停） ----
+
+    private func syncWatchers() {
+        if cards.isEmpty {
+            stopWatchers()
+            return
+        }
+        if followTimer == nil {
+            followTimer = Timer.scheduledTimer(withTimeInterval: CARD_FOLLOW_INTERVAL, repeats: true) { [weak self] _ in
+                self?.repositionCards()
+            }
+        }
+        if grantTimer == nil {
+            grantTimer = Timer.scheduledTimer(withTimeInterval: CARD_GRANT_WATCH_INTERVAL, repeats: true) { [weak self] _ in
+                self?.checkGrants()
+            }
+        }
+    }
+
+    private func stopWatchers() {
+        followTimer?.invalidate()
+        followTimer = nil
+        grantTimer?.invalidate()
+        grantTimer = nil
     }
 
     private func scheduleFade(_ entry: CardEntry, _ durationSec: Int) {
@@ -1033,6 +1185,7 @@ final class PermissionCardController {
                     entry.panel.orderOut(nil)
                     entry.panel.alphaValue = 1 // 下次重建时从全不透明起步
                 }
+                self.syncWatchers()
                 self.exitIfDone()
             })
         }

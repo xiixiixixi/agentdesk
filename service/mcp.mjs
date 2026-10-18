@@ -20,6 +20,8 @@
 // confirmationToken 并把 api 抛出的 needsConfirmation 错误转成结构化结果；
 // ab_download_open 没有对应 api 路径，由工具层直接走 policy + connection.cmd。
 
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -29,6 +31,9 @@ import { createLogin } from './login.mjs';
 import { createCua, registerCuaTools } from './cua.mjs';
 
 const EVAL_TIMEOUT_MS = 30_000;
+
+// 版本号单一事实来源：package.json（npm 发版/源码一致）
+const PKG = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'));
 
 // ---------- 小工具：统一可读结果 ----------
 
@@ -88,7 +93,7 @@ export function buildMcpServer({ api, policy = null, connections = null, service
   //（SDK 1.32.1 实测：Server.sendLoggingMessage 无此能力声明时静默跳过；客户端未
   //  setLevel 时默认放行 info 级）——用于 WebMCP 工具变化的即时推送。
   const server = new McpServer(
-    { name: 'chrome-agent-browser', version: '0.5.1' },
+    { name: 'agentdesk', version: PKG.version },
     { capabilities: { logging: {} } },
   );
   const loginFlow = createLogin({ credentials, audit }); // ab_login 流程（credentials 为 null 时由工具层先拦）

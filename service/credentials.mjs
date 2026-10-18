@@ -1,7 +1,7 @@
 // service/credentials.mjs — 凭据仓：macOS 钥匙串读写（可注入执行器，供测试 mock）
 //
 // 存储模型：一组凭据 = 钥匙串里的一个 generic password 条目
-//   service = "chrome-agent-browser"（固定服务名）
+//   service = "agentdesk"（固定服务名）
 //   account = <origin>（如 https://github.com，含端口则带端口）
 //   value   = JSON {"username","password","totp"?}
 // CLI 入口在仓库根 credential.mjs（npm run credential）；service 端 ab_login 只读。
@@ -17,7 +17,7 @@
 import { execFile } from 'node:child_process';
 import process from 'node:process';
 
-export const KEYCHAIN_SERVICE = 'chrome-agent-browser';
+export const KEYCHAIN_SERVICE = 'agentdesk';
 
 function defaultExec(cmd, args) {
   return new Promise((resolve) => {
@@ -66,7 +66,7 @@ export function sameSite(urlA, urlB) {
 
 /**
  * 解析 `security dump-keychain` 文本 → 本服务已存的 origin 清单（去重、排序）。
- * 只读元数据（class=genp + svce=chrome-agent-browser 条目的 acct），零秘密值。
+ * 只读元数据（class=genp + svce=agentdesk 条目的 acct），零秘密值。
  * 兼容命名键（"svce"<blob>=）与十六进制键（0x00000007 <blob>=）两种输出格式。
  */
 export function parseOrigins(dumpText) {

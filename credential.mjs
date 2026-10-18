@@ -5,7 +5,7 @@
 //   npm run credential -- list             # 只列已存 origin，不显示任何秘密
 //   npm run credential -- remove <origin>  # 删除一组凭据
 //
-// 凭据只进 macOS 钥匙串（服务名 chrome-agent-browser）；service 端 ab_login 据此
+// 凭据只进 macOS 钥匙串（服务名 agentdesk）；service 端 ab_login 据此
 // 全自动登录，凭据永不进入 AI 对话。非 macOS 明确报"当前仅支持 macOS 钥匙串"。
 
 import process from 'node:process';

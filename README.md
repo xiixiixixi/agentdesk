@@ -1,6 +1,6 @@
-# chrome-agent-browser
+# agentdesk
 
-一句话：让 AI 代理（agent）直接操控**你真实的、带登录态的 Chromium 系浏览器**，并按需延伸到**整块屏幕**（窗口清单 / 界面元素 / 截图 / 点击输入）——通过「浏览器扩展 + 原生宿主 + 本地服务」三层桥接，以 MCP（Model Context Protocol）工具面暴露给任意 MCP 客户端（ZCode / Cursor 等）。
+一句话：让 AI 代理（agent）**双通道操控你的电脑**——通道一：**你真实的、带登录态的 Chromium 系浏览器**（标签/导航/截图/无障碍树/CDP）；通道二：**整块屏幕**（任何应用的窗口清单 / 界面元素 / 截图 / 点击输入）。通过「浏览器扩展 + 原生宿主 + 本地服务 + CUA Helper 独立 App」四件套桥接，以 MCP（Model Context Protocol）工具面暴露给任意 MCP 客户端（ZCode / Cursor 等）。
 
 **纯本地架构**：所有指令只在你机器上的 127.0.0.1 里流动，不出网、无云端组件、无需账号。
 
@@ -10,7 +10,7 @@
 ┌─ 5 ─ MCP 客户端（任意支持 MCP 的 AI 工具）
 │        │ MCP over stdio（JSON-RPC 2.0）           ← service/mcp-entry.mjs（入口）
 │        ▼
-├─ 4 ─ MCP 工具面  service/mcp.mjs：30 个工具（ab_* 粗粒度 + browser_eval REPL + cua_* 屏幕操作）
+├─ 4 ─ MCP 工具面  service/mcp.mjs：30 个工具（ab_* 浏览器通道 + browser_eval REPL + cua_* 屏幕通道）
 │        ▼
 ├─ 3 ─ service 命令层  service/api.mjs（Agent API）+ policy.mjs（策略门）
 │        + connection.mjs（WS 服务端 / 租约镜像 / 心跳）
@@ -21,7 +21,10 @@
 │        ▼
 ├─ 1 ─ extension  extension/background.js（MV3）—— 租约权威 + chrome.debugger CDP 执行体
 │        ▼
-└─ 用户浏览器（Chrome/Edge/Brave/Opera/Vivaldi，真实 profile，登录态天然可用）
+└─ 用户浏览器（Chrome/Edge/Brave/Opera/Vivaldi/Arc，真实 profile，登录态天然可用）
+
+屏幕通道（cua_*）：service/cua.mjs → ~/.agentdesk/CUA Helper.app（swift/cua-helper.swift
+编译的独立后台 App，macOS TCC 权限的持权主体）/ osascript B 层兜底
 ```
 
 - 命令目录、事件、错误码、CDP 白名单的单一事实来源：`shared/protocol.mjs`。
@@ -31,30 +34,30 @@
 
 ```bash
 # 1. 全局安装（需要 Node 18+；全局路径固定 → 扩展 ID 稳定，升级不失效）
-npm install -g chrome-agent-browser
+npm install -g agentdesk
 
-# 2. 一条命令安装：自动算扩展ID → 检测已装浏览器 → 写清单/配置 → 打开 Chrome 扩展页
-#    （扩展目录路径自动进剪贴板）→ 原地等待验证，你在 Chrome 里加载完扩展那一刻自动打钩
-chrome-agent-browser          # 即 setup
+# 2. 一条命令安装：自动算扩展ID → 检测已装浏览器 → 写清单/配置 → 装 CUA Helper.app
+#    → 打开 Chrome 扩展页（目录路径自动进剪贴板）→ 原地等待验证
+agentdesk          # 即 setup
 ```
 
 MCP 配置（无需路径，命令已进 PATH）：
 
 ```json
-{ "mcpServers": { "chrome-agent-browser": { "command": "chrome-agent-browser-mcp" } } }
+{ "mcpServers": { "agentdesk": { "command": "agentdesk-mcp" } } }
 ```
 
-其他命令：`chrome-agent-browser-doctor`（体检）、`chrome-agent-browser-uninstall`（卸载）、
-`chrome-agent-browser -- --no-open/--port/--browser arc` 等参数照旧。
+其他命令：`agentdesk-doctor`（体检）、`agentdesk-uninstall`（卸载）、
+`agentdesk -- --no-open/--port/--browser arc` 等参数照旧。
 
 <details><summary>从 GitHub 源码安装（替代方式）</summary>
 
 ```bash
-git clone https://github.com/xiixiixixi/chrome-agent-browser.git
-cd chrome-agent-browser && npm install
+git clone https://github.com/xiixiixixi/agentdesk.git
+cd agentdesk && npm install
 npm run setup
 ```
-MCP 配置指向 `node /绝对路径/chrome-agent-browser/service/mcp-entry.mjs`。
+MCP 配置指向 `node /绝对路径/agentdesk/service/mcp-entry.mjs`。
 
 </details>
 
@@ -65,14 +68,14 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 > 扩展 ID 由扩展目录的绝对路径决定（Chrome 的规则）。**npm 全局安装的路径固定 → 升级版本 ID 不变**；
 > 源码安装的目录一旦移动就要重跑 setup 重新加载扩展。
 
-卸载：npm 安装用户 `chrome-agent-browser-uninstall` 后再 `npm uninstall -g chrome-agent-browser`；
-源码用户 `npm run uninstall`。两者都只删本机清单与配置，Chrome 内手动移除扩展即彻底干净。
+卸载：npm 安装用户 `agentdesk-uninstall` 后再 `npm uninstall -g agentdesk`；
+源码用户 `npm run uninstall`。两者都只删本机清单、配置与 CUA Helper.app，Chrome 内手动移除扩展即彻底干净。
 
-高级参数：`chrome-agent-browser -- --no-open`（不自动开 Chrome）/ `--port N` / `--timeout 秒` /
+高级参数：`agentdesk -- --no-open`（不自动开 Chrome）/ `--port N` / `--timeout 秒` /
 `--browser all|chrome|edge|brave|opera|vivaldi|arc` / `--dry-run`（源码用户等价命令 `npm run setup -- …`）。
 
-更新到新版：npm 安装用户 `npm update -g chrome-agent-browser`；源码用户 `git pull && npm install`。
-两者升级后扩展无需重新加载（ID 不变），但建议重跑一次 setup 刷新配置。
+更新到新版：npm 安装用户 `npm update -g agentdesk`；源码用户 `git pull && npm install`。
+两者升级后扩展无需重新加载（ID 不变），但建议重跑一次 setup 刷新配置与 CUA Helper.app。
 
 ## 服务生命周期（常问三问）
 
@@ -85,7 +88,7 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
   端口已占用后自动切换为「前端模式」连接既有服务，共享同一个浏览器连接；全部客户端退出后
   最后一个 service 进程退出，不留孤儿进程。
 
-## MCP 工具面（30 个 = 21 个浏览器 + 9 个屏幕操作）
+## MCP 工具面（30 个 = 21 个浏览器通道 + 9 个屏幕通道）
 
 | 工具 | 作用 |
 |---|---|
@@ -110,43 +113,49 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 | `cua_click` / `cua_type` / `cua_key` | 屏幕级点击（元素优先、坐标兜底；点击处闪现幽魂光标）/ 输入文本 / 按键（危险组合键过确认门） |
 | `cua_app_focus` / `cua_verify` | 应用切前台 / **物理验证**：返回动作前后两份截图证据，防"声称点了其实没点" |
 
-## 屏幕操作（CUA，v0.5.1）
+## 屏幕通道（CUA）
 
 浏览器之外，同一服务还提供 `cua_*` 工具族操控**整块屏幕**（任何应用，不限于浏览器）。
 设计原则：**分层注入**（元素级 AX 动作优先，坐标兜底）、**AX 优先**（先读无障碍树再谈坐标）、
 **物理验证**（动作留"前证据"，`cua_verify` 取"后证据"成对核对）、**能力探测**（逐级降级，如实报告）。
 
+### CUA Helper.app：权限挂在独立 App 上（v1.0.0）
+
+`npm run setup` 会自动把 Swift 助手装成 `~/.agentdesk/CUA Helper.app`（`com.agentdesk.cua-helper`，
+后台 App、无 Dock 图标、琥珀色品牌图标）。macOS 的辅助功能/屏幕录制权限（TCC）挂在这个 .app 上——
+**终端是谁不再重要**：换终端、换 AI 客户端、服务重启都不影响授权；helper 也可独立重启以重读授权。
+
+### 两条权限怎么开（拖一下就好）
+
+首次使用会自动引导：`npm run cua-selftest`（互动，自动打开设置面板并浮出引导卡片）或
+`npm run setup`（非交互，同样开面板+浮卡片后即返回）。引导形态（v1.0.0）：
+
+- 系统设置打开到正确面板的同时，屏幕上浮一张 **560×124 琥珀引导卡片**，贴在设置窗口
+  正下方并**跟随窗口移动**；
+- 卡片左侧的大图标就是拖拽句柄——**按住它拖出的就是 CUA Helper.app 本体**，直接放进
+  上方的「辅助功能」「屏幕录制」列表即完成授权（等同点列表下方的 + 号再选 App，少四步）；
+- 放手后**自动检测**（轮询权限状态，绝不弹系统对话框打扰）：一生效卡片自动消失、
+  helper 自动重启重读授权、终端里自动打钩，无需回车报到。
+
+手动开也在 **系统设置 → 隐私与安全性**：把「CUA Helper」加进/勾选「辅助功能」「屏幕录制」两项。
+
 ### 三层能力（逐级探测，优雅降级）
 
 | 层 | 条件 | 窗口清单 | 读元素 | 元素点击 | 坐标点击 | 输入/按键 | 截图 |
 |---|---|---|---|---|---|---|---|
-| **A**（最强） | `host/cua-helper` 已编译 + 辅助功能已授权 | ✓ | ✓（快） | ✓（AX 动作，失败自动取元素中心兜底） | ✓（**给 pid 定向投递，不动真实光标**） | ✓（可定向） | ✓ |
+| **A**（最强） | CUA Helper.app / host/cua-helper 已编译 + 辅助功能已授权 | ✓ | ✓（快） | ✓（AX 动作，失败自动取元素中心兜底） | ✓（先置前后全局注入，如实回执） | ✓（可定向） | ✓ |
 | **B**（零编译兜底） | 无 helper，但辅助功能已授权（osascript + System Events） | ✓ | ✓（较慢） | ✓ | ✗ | ✓（进前台应用） | ✓ |
 | **C**（无任何授权） | 辅助功能未授权 | helper 编译过时 ✓（窗口表本身无需授权） | ✗ | ✗ | ✗ | ✗ | ✓（需屏幕录制授权） |
 | **幽魂光标**（A 层附属能力） | helper 已编译 | 点击位置闪现琥珀色 AI 专属光标（叠加窗实现） | — | ✓（元素模式取目标窗口中心近似） | ✓（精确坐标） | ✓（30 秒内点击过则在原地提示箭头） | — |
 
 - A 层助手是随包分发的单文件 Swift 源码（`swift/cua-helper.swift`），`npm run setup` 自动用本机
-  swiftc 编译成 `host/cua-helper`（编译产物不入库；无 swiftc 时静默落到 B 层，不算安装失败）。
+  swiftc 编译并装进 CUA Helper.app（编译产物不入库；无 swiftc 时静默落到 B 层，不算安装失败）。
 - **幽魂光标（v0.5.1）**：AI 每次点击会在目标位置短暂闪现琥珀色 AI 光标（与扩展角标同色系，
   点击带一圈扩散涟漪，约 0.7 秒后淡出），输入则原地提示箭头——让你看得见 AI 动手在哪。
   叠加窗实现：**点击穿透、不抢焦点、真鼠标不动、无新系统权限**；叠加失败绝不影响真实动作，
   也不入审计（纯可视化）。`service/policy-defaults.json` 的 `"cuaOverlay": false` 可整体关闭。
-- `cua_status` 随时报告 `{tier, axGranted, screenGranted, responsibleProcess, permissionGuide:{text,card}, helperCompiled, swiftcAvailable, overlay, capabilities, guidance}`；
+- `cua_status` 随时报告 `{tier, axGranted, screenGranted, responsibleProcess, helperApp, permissionGuide, helperCompiled, swiftcAvailable, overlay, capabilities, guidance}`；
   `npm run cua-selftest` 是只读的交互动全清单自检（**不做任何点击**，含一次屏幕中央幽魂光标试闪，安全默认）。
-
-### 两条授权怎么开（人话）
-
-首次使用会自动引导：`npm run cua-selftest`（互动，缺权限时自动弹系统申请并一步步带你勾选）
-或 `npm run setup`（非交互，编译完助手即自动申请并打印指引）。系统弹的是 macOS 标准授权对话框，
-本工具只负责把「负责进程」（通常是你的终端）注册进设置列表，开关始终在你手里。
-**引导卡片（v0.5.4）**：申请的同时会自动打开对应设置面板，并在屏幕上浮一张琥珀色引导卡片
-（120 秒后自动消失）——卡片的琥珀图标就是拖拽句柄，按住它可以把你的终端 App 直接拖进
-辅助功能/屏幕录制列表（等同点列表下方的 + 号）；主路径仍是「点 + 号 → 选你的终端」，拖拽
-只是快捷方式。helper 太旧时卡片静默跳过，终端里的文字引导不变。手动开也在
-**系统设置 → 隐私与安全性**：
-
-1. **辅助功能**：勾选你运行 MCP 客户端的那个终端/应用 → 元素读取/点击/输入可用（A/B 层）。
-2. **屏幕录制**：勾选同一项 → 截图可用；未授权时截图可能只剩桌面壁纸、窗口标题缺失（系统隐私裁剪，工具会如实报告）。
 
 ### 安全模型（cua 部分补遗）
 
@@ -155,13 +164,18 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 - **危险键确认**：默认 `cua_key` 的 `cmd+q`（退程序）/ `cmd+w`（关窗）首次返回待确认 token，
   `ab_confirm` 批准后带 `confirmationToken` 重试才执行；名单可在 `service/policy-defaults.json`
   的 `confirmCuaKeys` 配置，其余按键/点击/输入直行。
+- **状态查询永不弹窗**：权限检测一律走不带 prompt 的只读探测（`AXIsProcessTrusted` /
+  `CGPreflightScreenCaptureAccess`）；授权手势只属于宿主引导 UI（那张可拖拽卡片），agent/MCP 面
+  无法触发系统弹窗。
 - **物理验证（防幻觉）**：每个动作执行前自动对目标区域截一张"前证据"；`cua_verify` 再取
   "后证据"成对返回。**声称已点击不算数**——调用方必须核对两份截图确认界面真的变了。
 
 ### 已知限制（如实声明）
 
-- 坐标点击分两档：**给 pid = 定向投递给目标进程（真实鼠标不动）**；不给 pid = 全局投递
-  （**会移动你的真实光标**，工具描述已标明，慎用）。
+- 坐标点击：**给 pid = 先把目标置前后全局注入**（进程定向鼠标注入在现代 macOS 已不生效，结果
+  里 `fallback:"global"` 如实标注）；不给 pid = 全局投递。两者**都会移动你的真实光标**，工具
+  描述已标明，慎用。
+- **拖入列表即授权**在个别 macOS 版本上可能仍需手动开开关（系统行为），自检会如实复测并提示。
 - **幽魂光标**：点击位置显示琥珀色 AI 光标（叠加窗实现，无新系统权限、点击穿透、不抢焦点、
   真鼠标不动），短暂显示后自动淡出；仅 A 层可用，`cuaOverlay` 可关。元素点击（AX press 无
   坐标语义）取目标窗口中心近似，坐标兜底时会精化到真实落点。
@@ -172,7 +186,7 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 
 ## 安全模型
 
-- **租约可见**：被 agent 控制的标签页进专属标签组 + 橙色 ● 角标；谁借走哪个页面有据可查。
+- **租约可见**：被 agent 控制的标签页进专属标签组（AgentDesk）+ 橙色 ● 角标；谁借走哪个页面有据可查。
 - **审计日志**：AI 的每次浏览器操作本地留痕（`audit/` 目录 JSONL，只记有副作用的命令与人工确认，敏感值脱敏；可用 `ab_audit` 查询，host-config 设 `auditDisabled:true` 或 `CAB_AUDIT=off` 可关闭）。
 - **策略门**（`service/policy-defaults.json` 可自定义）：默认拦截 `chrome://settings` 等敏感页；危险动作（打开下载文件、部分 CDP）需人工确认令牌放行；未知动作类型一律拒绝（fail-closed）。
 - **CDP 白名单**：`shared/protocol.mjs` 的 `CDP_ALLOWLIST` 之外的调试指令，服务端直接拒绝，到不了浏览器。
@@ -209,10 +223,10 @@ npm run credential -- remove https://github.com
 ## 测试
 
 ```bash
-npm test          # 135+ 个单元测试
+npm test          # 140+ 个单元测试
 npm run selftest  # 全链路自检（真 WS + 伪扩展，无需浏览器）
-npm run cua-selftest  # 屏幕操作自检（只读探测 + 试拍，不做任何点击）
-npm run doctor    # 本机链路体检：扩展目录/通信清单/端口监听/CUA 助手与授权，逐项给修复建议
+npm run cua-selftest  # 屏幕通道自检（只读探测 + 试拍，不做任何点击）
+npm run doctor    # 本机链路体检：扩展目录/通信清单/端口监听/CUA Helper 与授权，逐项给修复建议
 npm run e2e       # 端到端（需 Playwright 的 Chromium for Testing；自动装/清清单，不碰用户 Chrome；登录用例会短暂写入并清理本机钥匙串测试条目）
 npm run verify    # 一键真机验收：起服务等真实浏览器扩展连入（40s），11 项检查（标签/导航/截图/批量阅读/WebMCP/审计/CUA/幽魂试闪）输出记分卡；只动自建标签页
 npm run check     # 全部语法检查

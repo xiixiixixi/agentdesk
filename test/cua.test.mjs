@@ -10,14 +10,18 @@
 //   - MCP 工具族（9 个 cua_* 注册；cua_status / cua_screenshot / cua_key 经 InMemoryTransport）
 //   - 幽魂光标（v0.5.1）：overlay-show 拼装/窗口中心近似/xyFallback 落点精化；失败不阻塞动作；
 //     cuaOverlay 开关（false 零调用）；type/key 30s 提示窗口（假时钟）；叠加不入审计、不污染前证据
-//   - 授权引导（v0.5.3）：requestPermissions 协议拼装/解析（fake helper + 旧 helper unknown-cmd
-//     就地重编译重试）；status 新字段 responsibleProcess/permissionGuide（v0.5.4 起 {text,card}；
-//     全授权时 guide=null；status 绝不触发申请——探测无副作用）；runGuidedGrant 分支（已授权/
-//     非 TTY/跳过/申请+复测/申请失败）；纯函数 missingPermissions/permissionGuideText/degradedNote
-//   - 引导卡片（v0.5.4）：show/hidePermissionCard 协议拼装与 kind 校验；openPrivacyPane 面板 URL；
-//     runGuidedGrant 申请后浮卡+开面板、复测/跳过都收卡、旧 helper 静默降级；纯函数
-//     missingCardKinds/showGuideCards/hideGuideCards；Swift 源码要件（可交互面板/拖拽句柄/
-//     双卡错位/EOF 留守）+ 真编译产物的双卡不重叠/就地更新/幂等隐藏
+//   - 授权引导（v0.5.3 起；v1.0.0 拖 .app + 自动检测）：requestPermissions 协议拼装/解析
+//     （fake helper + 旧 helper unknown-cmd 就地重编译重试）；status 新字段
+//     responsibleProcess/helperApp/permissionGuide（{text,card}；全授权时 guide=null；
+//     status 绝不触发申请——探测无副作用）；runGuidedGrant 分支（已授权/非 TTY/跳过/
+//     裸 CLI 申请+复测/申请失败/bundled 拖拽主路径不弹系统对话框 + waitForGrant 自动检测生效
+//     即收卡重启 helper/自动检测超时降级回车）；纯函数 missingPermissions/permissionGuideText/degradedNote
+//   - 引导卡片（v0.5.4 起；v1.0.0 升级 560×124 + 贴靠跟随）：show/hidePermissionCard 协议拼装与
+//     kind 校验；openPrivacyPane 面板 URL；runGuidedGrant 浮卡+开面板、复测/跳过都收卡、
+//     旧 helper 静默降级；纯函数 missingCardKinds/showGuideCards/hideGuideCards；Swift 源码要件
+//     （可交互面板/拖拽句柄/双卡错位/EOF 留守/系统设置贴靠跟随/授权自动检测/bundle 自识别）
+//     + 真编译产物的双卡不重叠/就地更新/幂等隐藏
+//   - CUA Helper.app（v1.0.0）：ensureCuaHelperApp 目录结构/Info.plist 要件/可执行位/图标拷贝/幂等
 //   - Swift 助手自检：swiftc 可用则编译到临时目录跑 probe/windows/ax-tree（含 overlay 协议错误分支）；
 //     编译失败/无 swiftc/非 macOS → SKIP（带原因，不算失败）；源码级 overlay/授权申请协议要件断言
 
@@ -40,6 +44,10 @@ import { buildMcpServer } from '../service/mcp.mjs';
 import {
   createCua, createHelperClient, compileHelper, swiftcPath, keyCombo, SWIFT_SRC_PATH,
 } from '../service/cua.mjs';
+import {
+  CUA_APP_BUNDLE_ID, CUA_APP_NAME, buildCuaHelperInfoPlist, ensureCuaHelperApp,
+  agentdeskHome, cuaHelperAppBundlePath, cuaHelperAppBinaryPath,
+} from '../service/cua-app.mjs';
 import {
   missingPermissions, missingCardKinds, permissionGuideText, cTierNote, degradedNote, runGuidedGrant,
   showGuideCards, hideGuideCards, CARD_DEFAULT_SEC,
@@ -722,12 +730,96 @@ test('swift 源码实现 permission-card 协议：可交互面板/可拖动/文�
   assert.match(src, /\.nonactivatingPanel/, '非激活面板（不抢系统设置的焦点）');
   assert.match(src, /beginDraggingSession/, '图标句柄发起文件拖拽');
   assert.match(src, /NSDraggingSource/, '拖拽源协议');
-  assert.match(src, /responsibleAppBundleURL\(\)/, '拖拽 promise 的是负责进程的 .app bundle（TCC 记账对象）');
+  assert.match(src, /responsibleAppBundleURL\(\)/, '拖拽 promise 的是持权 .app bundle（TCC 记账对象）');
   assert.match(src, /CARD_H \+ CARD_GAP/, '双卡纵向错位（accessibility 在上、screen 在下）');
   assert.match(src, /noteStdinClosed\(\)/, 'stdin EOF 经卡片控制器决策');
   assert.match(src, /exitAfterCardsClose/, '卡片在屏时留守、收齐再退（setup 非交互留卡）');
   assert.match(src, /"dragFrom"/, '应答透传拖拽句柄的 .app 路径');
   assert.match(src, /"frame"/, '应答带屏幕坐标 frame（两卡不重叠的可测依据）');
+});
+
+test('swift 源码 v1.0.0 要件：560×124 卡片/贴靠跟随系统设置/授权自动检测/bundle 自识别/品牌', () => {
+  const src = readFileSync(SWIFT_SRC_PATH, 'utf8');
+  // 卡片尺寸：560×124（贴靠系统设置窗的引导大卡）
+  assert.match(src, /let CARD_W: CGFloat = 560/, '卡片宽 560');
+  assert.match(src, /let CARD_H: CGFloat = 124/, '卡片高 124');
+  // 贴靠跟随：150ms 轮询 + 按 bundleId 找系统设置窗口（跨语言稳定）+ 贴下沿上叠 6px
+  assert.match(src, /CARD_FOLLOW_INTERVAL: TimeInterval = 0\.15/, '150ms 跟随轮询');
+  assert.match(src, /SETTINGS_BUNDLE_ID = "com\.apple\.systempreferences"/, '系统设置按 bundleId 识别（ownerName 会本地化）');
+  assert.match(src, /s\.maxY - 6/, '贴设置窗下沿（上叠 6px）');
+  assert.match(src, /systemSettingsWindow\(\)/, '窗口探测函数');
+  assert.match(src, /freezeFollow/, '图标拖拽期间冻结跟随');
+  assert.match(src, /followsSettings = false/, '用户手动挪卡后停止跟随');
+  // 授权自动检测：1.2s 轮询 AXIsProcessTrusted（不带 prompt）/ CGPreflight，生效即收卡
+  assert.match(src, /CARD_GRANT_WATCH_INTERVAL: TimeInterval = 1\.2/, '1.2s 授权自动检测轮询');
+  assert.match(src, /checkGrants\(\)/, '自动检测入口');
+  assert.match(src, /cards\["accessibility"\] != nil, axTrusted\(\)/, 'AX 用不带 prompt 的探测');
+  assert.match(src, /cards\["screen"\] != nil, CGPreflightScreenCaptureAccess\(\)/, '屏幕用 preflight 探测');
+  // bundle 自识别：从 .app 内运行 → 权限主体是本 .app（终端无关）
+  assert.match(src, /Bundle\.main\.bundleIdentifier != nil/, 'bundle 识别（.app vs 裸 CLI）');
+  assert.match(src, /"helperBundle"/, 'probe 回传 .app 身份（id/name/path）');
+  assert.match(src, /Bundle\.main\.bundleURL/, '拖拽句柄优先本 .app 本体');
+  // 品牌
+  assert.match(src, /drawText\("AgentDesk"/, '卡片产品名 AgentDesk');
+  // 旧品牌词守卫（拼串构成，源码不落旧品牌字面量）
+  assert.doesNotMatch(src, new RegExp(['Chrome', 'Agent', 'Browser'].join(' ')), '旧品牌零残留');
+});
+
+// ---------- 8.5 CUA Helper.app（v1.0.0：权限挂在独立 .app 上） ----------
+
+test('cua-app：ensureCuaHelperApp 建齐 .app 结构（Info.plist 要件/可执行位/图标），幂等重装不报错', { timeout: 30_000 }, () => {
+  const home = mkdtempSync(join(tmpdir(), 'ab-cua-app-'));
+  const srcDir = mkdtempSync(join(tmpdir(), 'ab-cua-src-'));
+  try {
+    // 假 helper 二进制 + 假图标（不依赖真编译/真资产）
+    const srcBin = join(srcDir, 'cua-helper');
+    writeFileSync(srcBin, '#!/bin/sh\necho fake\n');
+    chmodSync(srcBin, 0o755);
+    const iconSrc = join(srcDir, 'AppIcon.icns');
+    writeFileSync(iconSrc, 'fake-icns-bytes');
+
+    const r = ensureCuaHelperApp({ srcBinary: srcBin, home, iconSrc, codesign: false });
+    assert.equal(r.installed, true, `应安装成功: ${r.reason ?? ''}`);
+    assert.equal(r.appPath, cuaHelperAppBundlePath(home));
+    assert.equal(r.binaryPath, cuaHelperAppBinaryPath(home));
+    assert.ok(agentdeskHome(home).endsWith(`/${'.agentdesk'}`), '装在 ~/.agentdesk 下');
+    assert.ok(existsSync(join(r.appPath, 'Contents', 'MacOS', 'cua-helper')), '二进制就位');
+    assert.ok(existsSync(join(r.appPath, 'Contents', 'Resources', 'AppIcon.icns')), '图标就位');
+    assert.equal(r.iconInstalled, true);
+
+    // Info.plist 要件：bundle id / 名称 / LSUIElement / 用途描述
+    const plist = readFileSync(join(r.appPath, 'Contents', 'Info.plist'), 'utf8');
+    assert.ok(plist.includes(`<string>${CUA_APP_BUNDLE_ID}</string>`), 'CFBundleIdentifier=com.agentdesk.cua-helper');
+    assert.ok(plist.includes(`<string>${CUA_APP_NAME}</string>`), 'CFBundleName=CUA Helper');
+    assert.ok(plist.includes('<key>LSUIElement</key>'), 'LSUIElement（后台 App 无 Dock 图标）');
+    assert.ok(plist.includes('<key>NSAppleEventsUsageDescription</key>'), '用途描述键在');
+    assert.ok(plist.includes('AgentDesk screen control'), '用途描述内容');
+    assert.ok(plist.includes('<string>cua-helper</string>'), 'CFBundleExecutable');
+
+    // 幂等：再来一次同样成功（sameFile 跳过重拷不报错）
+    const r2 = ensureCuaHelperApp({ srcBinary: srcBin, home, iconSrc, codesign: false });
+    assert.equal(r2.installed, true);
+    assert.equal(r2.copiedBinary, false, '内容未变不重拷（TCC 身份稳定）');
+
+    // buildCuaHelperInfoPlist 纯函数：转义与自定义版本
+    const xml = buildCuaHelperInfoPlist({ version: '9.9.9' });
+    assert.ok(xml.includes('<string>9.9.9</string>'));
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(srcDir, { recursive: true, force: true });
+  }
+});
+
+test('cua-app：缺二进制 → installed:false 带人话原因；路径助手不含品牌旧名', () => {
+  const home = mkdtempSync(join(tmpdir(), 'ab-cua-app2-'));
+  try {
+    const r = ensureCuaHelperApp({ srcBinary: join(home, 'nope'), home, codesign: false });
+    assert.equal(r.installed, false);
+    assert.match(r.reason, /不存在/);
+    assert.equal(cuaHelperAppBinaryPath(home).includes('CUA Helper.app'), true);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 // ---------- 9. 幽魂光标叠加（v0.5.1） ----------
@@ -924,7 +1016,7 @@ test('旧版 helper 无 request-permissions（unknown-cmd）：引导层就地�
     });
     assert.equal(r.mode, 'requested', '重编译重试后引导成功');
     assert.equal(r.requested.axRequested, true);
-    assert.equal(stops.length, 1, '重编译后必须 stop 旧进程（下次请求从新二进制拉起）');
+    assert.ok(stops.length >= 1, '重编译后必须 stop 旧进程（v1.0.0 生效后 settle 还会再 stop 一次重启 helper）');
   } finally {
     cua.stop();
     rmSync(f.dir, { recursive: true, force: true });
@@ -1021,10 +1113,10 @@ test('runGuidedGrant 分支：已授权直通（零交互零申请）；无 io=�
   assert.equal(requested, 0, '跳过时不调 request-permissions');
 });
 
-test('runGuidedGrant 正常引导：两问推进、申请一次、复测 status 返回新状态与仍缺项', async () => {
+test('runGuidedGrant 正常引导（裸 CLI 兼容路径）：申请一次、回车验证、复测 status 返回新状态与仍缺项', async () => {
   const logs = [];
   const stAfter = { supported: true, tier: 'A', axGranted: true, screenGranted: false, helperCompiled: true };
-  const cua = fakeCua({ st: stAfter });
+  const cua = fakeCua({ st: stAfter, legacy: true }); // 无 waitForGrant 的旧桩 → 退化为回车确认
   const io = fakeIo(['enter', 'enter']);
   const g = await runGuidedGrant({
     cua,
@@ -1037,13 +1129,13 @@ test('runGuidedGrant 正常引导：两问推进、申请一次、复测 status 
   assert.deepEqual(g.missing, { ax: false, screen: true }, 'AX 已补齐、屏幕仍缺');
   assert.equal(cua.calls.requestPermissions, 1);
   assert.equal(cua.calls.status, 1, '复测一次 probe');
-  assert.equal(io.prompts.length, 2, '两问：开始申请 / 开好后验证');
+  assert.equal(io.prompts.length, 2, '两问：开始引导 / 开好后验证');
   const text = logs.join('\n');
   assert.ok(text.includes('第 1 步') && text.includes('辅助功能'));
   assert.ok(text.includes('第 2 步') && text.includes('屏幕录制'));
   assert.ok(text.includes('Ghostty'), '引导里给要勾选的名字');
-  assert.ok(io.prompts[0].includes('按回车开始申请'), '第一问=开始申请');
-  assert.ok(io.prompts[1].includes('琥珀色引导卡片') && io.prompts[1].includes('完成后按回车'), '第二问=看卡片带路（v0.5.4 起本 fake 有卡片能力）');
+  assert.ok(io.prompts[0].includes('按回车打开系统设置'), '第一问=打开设置开始引导');
+  assert.ok(io.prompts[1].includes('开好后按回车'), '第二问（旧桩无自动检测）=开好后回车验证');
 
   // 申请抛错（如 helper 消失）：mode=error 带原错误，不崩
   const bad = await runGuidedGrant({
@@ -1056,10 +1148,76 @@ test('runGuidedGrant 正常引导：两问推进、申请一次、复测 status 
   assert.match(bad.error.message, /helper died/);
 });
 
-/** fake cua：只实现引导所需的 status/requestPermissions/卡片方法/stop，调用计数进 calls。 */
-function fakeCua({ st = {}, failWith = null, permResult = null } = {}) {
-  const calls = { status: 0, requestPermissions: 0, showCard: [], hideCard: [], openPane: [] };
-  return {
+test('runGuidedGrant v1.0.0 拖拽主路径（bundled）：不弹系统申请，直接浮卡开面板，自动检测生效即收卡重启复测', async () => {
+  const logs = [];
+  const stAfter = { supported: true, tier: 'A', axGranted: true, screenGranted: true, helperCompiled: true, helperApp: { name: 'CUA Helper', path: '/home/u/.agentdesk/CUA Helper.app' } };
+  const cua = fakeCua({
+    st: stAfter,
+    waitResult: { granted: true, axGranted: true, screenGranted: true, waitedMs: 4200 },
+  });
+  const io = fakeIo([]); // 自动检测先兑现：一问之后无需任何回车
+  const g = await runGuidedGrant({
+    cua,
+    st: { supported: true, tier: 'C', axGranted: false, screenGranted: false, helperCompiled: true, helperApp: { name: 'CUA Helper', path: '/home/u/.agentdesk/CUA Helper.app' } },
+    io,
+    log: (s) => logs.push(s),
+  });
+  assert.equal(g.mode, 'requested');
+  assert.equal(cua.calls.requestPermissions, 0, 'bundled 主路径不向系统弹申请对话框（拖 .app 即手势）');
+  assert.equal(cua.calls.waitForGrant, 1, '自动检测等待一次');
+  assert.equal(cua.calls.stop, 1, '生效后重启 helper（结束旧实例，下次请求自动从 .app 重启）');
+  assert.deepEqual(cua.calls.showCard.map((c) => c.kind), ['accessibility', 'screen'], '两卡都浮');
+  assert.ok(cua.calls.showCard.every((c) => c.appName === 'CUA Helper'), '卡片文案给 CUA Helper（权限主体）');
+  assert.deepEqual(cua.calls.openPane, ['accessibility'], '开到辅助功能面板');
+  assert.deepEqual(cua.calls.hideCard.sort(), ['accessibility', 'screen'], '生效后两卡都收');
+  assert.equal(io.prompts.length, 2, '两段提示：开始引导 + 自动检测就位（无需回车即兑现）');
+  assert.ok(io.prompts[1].includes('自动检测'), '第二段提示文案=自动检测中');
+  const text = logs.join('\n');
+  assert.ok(text.includes('终端是谁无关'), '讲清新权限模型');
+  assert.ok(text.includes('拖'), '拖拽指引在文案里');
+  assert.ok(text.includes('✓ 权限已生效'), '输出确认');
+});
+
+test('runGuidedGrant 自动检测超时：降级为回车确认，回车后照常复测收卡', async () => {
+  const stAfter = { supported: true, tier: 'A', axGranted: false, screenGranted: false, helperCompiled: true, helperApp: { name: 'CUA Helper', path: '/x/CUA Helper.app' } };
+  const cua = fakeCua({ st: stAfter, waitResult: new Promise((res) => setTimeout(() => res({ granted: false, axGranted: false, screenGranted: false, waitedMs: 120_000 }), 30)) });
+  const io = fakeIo(['enter', 'enter']);
+  const g = await runGuidedGrant({
+    cua,
+    st: { supported: true, axGranted: false, screenGranted: false, helperCompiled: true, helperApp: { name: 'CUA Helper', path: '/x/CUA Helper.app' } },
+    io,
+    log: () => {},
+  });
+  assert.equal(g.mode, 'requested');
+  assert.equal(io.prompts.length, 3, '开始引导 / 自动检测提示 / 超时降级回车，三问');
+  assert.ok(io.prompts[2].includes('开好后按回车'), '验证未过 → 超时后回到回车确认');
+  assert.equal(cua.calls.waitForGrant, 2, '自动检测等待 + 回车立即复验各一次');
+  assert.deepEqual(cua.calls.hideCard.sort(), ['accessibility', 'screen'], '收尾仍收卡');
+});
+
+test('runGuidedGrant v1.0.0 拖拽主路径：Ctrl+C 在自动检测阶段跳过 → 收卡不申请不重启', async () => {
+  const cua = fakeCua({ waitResult: new Promise(() => {}) }); // 永不兑现：让 ask 先回来
+  const io = fakeIo(['enter', 'skip']);
+  const g = await runGuidedGrant({
+    cua,
+    st: { supported: true, axGranted: false, screenGranted: false, helperCompiled: true, helperApp: { name: 'CUA Helper', path: '/x/CUA Helper.app' } },
+    io,
+    log: () => {},
+  });
+  assert.equal(g.mode, 'skipped');
+  assert.equal(cua.calls.requestPermissions, 0);
+  assert.equal(cua.calls.stop, 0, '跳过不重启 helper');
+  assert.ok(cua.calls.hideCard.length >= 1, '跳过也收卡');
+});
+
+/**
+ * fake cua：实现引导所需的 status/requestPermissions/waitForGrant/卡片方法/stop，调用计数进 calls。
+ * legacy=true 时不提供 waitForGrant（模拟 v0.5.x 老二进制 → 引导退化为回车确认）。
+ * waitResult 为 Promise 时原样返回（可控 race 时序：永不兑现=跳过路径、延迟兑现=超时路径）。
+ */
+function fakeCua({ st = {}, failWith = null, permResult = null, waitResult = null, legacy = false } = {}) {
+  const calls = { status: 0, requestPermissions: 0, waitForGrant: 0, showCard: [], hideCard: [], openPane: [], stop: 0 };
+  const base = {
     calls,
     async status() { calls.status += 1; return { ...st }; },
     async requestPermissions() {
@@ -1070,7 +1228,16 @@ function fakeCua({ st = {}, failWith = null, permResult = null } = {}) {
     async showPermissionCard({ kind, appName, durationSec } = {}) { calls.showCard.push({ kind, appName, durationSec }); return { kind }; },
     async hidePermissionCard(kind) { calls.hideCard.push(kind); },
     async openPrivacyPane(kind) { calls.openPane.push(kind); },
-    stop() {},
+    stop() { calls.stop += 1; },
+  };
+  if (legacy) return base;
+  return {
+    ...base,
+    async waitForGrant() {
+      calls.waitForGrant += 1;
+      if (waitResult instanceof Promise) return waitResult;
+      return waitResult ?? { granted: true, axGranted: true, screenGranted: true, waitedMs: 1 };
+    },
   };
 }
 
@@ -1080,13 +1247,13 @@ test('引导纯函数：missingPermissions/permissionGuideText/degradedNote 的�
   assert.deepEqual(missingPermissions(null), { ax: true, screen: true });
 
   const both = permissionGuideText({ responsibleProcess: 'Ghostty', ax: true, screen: true });
-  assert.ok(both.includes('①「辅助功能」勾选「Ghostty」'));
-  assert.ok(both.includes('②「屏幕录制」勾选「Ghostty」'));
+  assert.ok(both.includes('①「辅助功能」加入/勾选「Ghostty」'));
+  assert.ok(both.includes('②「屏幕录制」加入/勾选「Ghostty」'));
   assert.ok(both.includes('cua-selftest'), '指引提示可自动申请的入口');
 
   const screenOnly = permissionGuideText({ responsibleProcess: null, ax: false, screen: true });
-  assert.ok(screenOnly.startsWith('系统设置 → 隐私与安全性 → ①「屏幕录制」'), '只缺屏幕时只列屏幕，序号自洽');
-  assert.ok(screenOnly.includes('运行本程序的终端'), '无名时给兜底说法');
+  assert.ok(screenOnly.includes('①「屏幕录制」加入/勾选'), '只缺屏幕时只列屏幕，序号自洽');
+  assert.ok(screenOnly.includes('CUA Helper'), '无名时给 CUA Helper 兜底说法（跑 setup 自动装）');
 
   assert.ok(cTierNote().includes('C 层'), '跳过时诚实报 C 层限制');
   assert.ok(degradedNote({ axGranted: false, screenGranted: false }).includes('C 层'), 'AX 缺 → C 层说明');
@@ -1198,11 +1365,11 @@ test('runGuidedGrant 悬浮卡片：申请后为仍缺项浮卡（带负责进�
   ]);
   assert.deepEqual(cua.calls.openPane, ['accessibility'], '双缺时先开辅助功能面板');
   assert.deepEqual([...cua.calls.hideCard].sort(), ['accessibility', 'screen'], '复测后两卡都收');
-  assert.ok(io.prompts[1].includes('琥珀色引导卡片') && io.prompts[1].includes('拖进列表或点 + 号'), '第二问提示看卡片带路');
-  assert.ok(logs.some((s) => s.includes('拖进系统设置列表即可授权')), '日志告知卡片已出现');
+  assert.ok(io.prompts[1].includes('自动检测'), '第二阶段提示=自动检测中（v1.0.0 默认推进方式）');
+  assert.ok(logs.some((s) => s.includes('拖进上方列表即可授权')), '日志告知卡片已出现');
 
-  // 第二问跳过（Ctrl+C）：也要收卡（否则要干等自动淡出）
-  const cua2 = fakeCua({ st: stAfter });
+  // 第二问跳过（Ctrl+C）：也要收卡（否则要干等自动淡出）——wait 永不兑现，让 ask 的 skip 先回
+  const cua2 = fakeCua({ st: stAfter, waitResult: new Promise(() => {}) });
   const g2 = await runGuidedGrant({
     cua: cua2,
     st: { supported: true, axGranted: false, screenGranted: false, helperCompiled: true, responsibleProcess: 'Ghostty' },
@@ -1275,7 +1442,7 @@ test('卡片开关纯函数：missingCardKinds 顺序与取舍；showGuideCards 
   const shown = await showGuideCards(ok, { ax: true, screen: true }, 'Ghostty', { log: (s) => logs.push(s) });
   assert.deepEqual(shown, ['accessibility', 'screen']);
   assert.deepEqual(ok.calls.showCard.map((c) => c.appName), ['Ghostty', 'Ghostty']);
-  assert.equal(logs.filter((s) => s.includes('拖进系统设置列表即可授权')).length, 1);
+  assert.equal(logs.filter((s) => s.includes('拖进上方列表即可授权')).length, 1);
 
   // 部分失败（screen 那张旧 helper 不认）：只返回成功的那张，不抛错
   const partial = {

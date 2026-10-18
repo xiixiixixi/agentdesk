@@ -1,4 +1,4 @@
-# chrome-agent-browser 线缆协议（PROTOCOL_VERSION = 1）
+# agentdesk 线缆协议（PROTOCOL_VERSION = 1）
 
 ## 1. 分层
 
@@ -19,7 +19,7 @@ service (service/service.mjs) ——命令层 + 租约镜像 + MCP 服务器
 ## 2. 握手
 
 1. service 启动 → 监听 `127.0.0.1:<port>`（端口写进安装时生成的 host 配置）。
-2. 扩展 background 启动 → `chrome.runtime.connectNative('com.chromeagentbrowser.host')`。
+2. 扩展 background 启动 → `chrome.runtime.connectNative('com.agentdesk.host')`。
 3. host 进程启动 → 读同目录 `host-config.json` → 连 service WS → 发 `host/hello`：
    `{jsonrpc:"2.0", id:1, method:"host/hello", params:{protocol:1, hostVersion, pid}}`
 4. 扩展发第一个通知注册自己：

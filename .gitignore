@@ -3,10 +3,8 @@ node_modules/
 
 # 本机生成的文件（setup/installer 会重建，且含机器特定绝对路径）
 host/host-config.json
-host/chrome-agent-browser-host
-host/chrome-agent-browser-host.cmd
-host/agent-browser-host
-host/agent-browser-host.cmd
+host/agentdesk-host
+host/agentdesk-host.cmd
 host/cua-helper
 *.bak
 
@@ -21,3 +19,4 @@ docs/REFERENCE-MAP.md
 *.log
 .idea/
 .vscode/
+work/

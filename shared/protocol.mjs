@@ -1,4 +1,4 @@
-// shared/protocol.mjs — single source of truth for the chrome-agent-browser wire protocol.
+// shared/protocol.mjs — single source of truth for the agentdesk wire protocol.
 //
 // Layers (see docs/PROTOCOL.md):
 //   extension <--(Chrome Native Messaging, JSON per frame)--> native host

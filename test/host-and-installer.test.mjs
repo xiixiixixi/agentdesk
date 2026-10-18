@@ -227,8 +227,8 @@ test('host: 端到端——hello 握手 / 双向转发 / 坏帧丢弃 / 断线 e
 // ===========================================================================
 
 test('installer: computeExtensionId 已知向量 + 稳定性 + 路径必须存在', () => {
-  // 已知向量（SHA-256("/tmp/chrome-agent-browser-known-vector") 前 16 字节 hex → a-p 映射）
-  assert.equal(computeExtensionId('/tmp/chrome-agent-browser-known-vector', { mustExist: false }), 'bieljbijnbdlnnbnbnhdkaahpbfjcopk');
+  // 已知向量（SHA-256("/tmp/agentdesk-known-vector") 前 16 字节 hex → a-p 映射）
+  assert.equal(computeExtensionId('/tmp/agentdesk-known-vector', { mustExist: false }), 'damlpnahfpbclnmbipagkphdncicfojg');
   // 稳定性：多次计算一致
   const once = computeExtensionId(REPO_ROOT, { mustExist: false });
   const twice = computeExtensionId(REPO_ROOT, { mustExist: false });
@@ -278,7 +278,7 @@ test('installer: Windows 清单走统一缓存目录 + 注册表命令（非 Win
   assert.equal(winPath.length, 1);
   assert.equal(
     winPath[0],
-    ['C:', 'Users', 'u', 'AppData', 'Local', 'ChromeAgentBrowser', 'NativeMessagingHosts', `${NATIVE_HOST_NAME}.json`].join('\\'),
+    ['C:', 'Users', 'u', 'AppData', 'Local', 'AgentDesk', 'NativeMessagingHosts', `${NATIVE_HOST_NAME}.json`].join('\\'),
   );
 
   // dry-run + 模拟 win32：不执行 reg，但记录 registry-add 动作
@@ -287,7 +287,7 @@ test('installer: Windows 清单走统一缓存目录 + 注册表命令（非 Win
     platform: 'win32',
     env: {},
   });
-  assert.ok(result.actions.some((a) => a.action === 'registry-add' && a.path === 'HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.chromeagentbrowser.host'));
+  assert.ok(result.actions.some((a) => a.action === 'registry-add' && a.path === 'HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.agentdesk.host'));
   assert.ok(!existsSync(path.join(tmp, 'AppData')));
   rmSync(tmp, { recursive: true, force: true });
 
@@ -296,7 +296,7 @@ test('installer: Windows 清单走统一缓存目录 + 注册表命令（非 Win
   const result2 = await runInstall(parseArgs(['--browser', 'chrome', '--extension-id', ID_A, '--home', tmp2, '--dry-run']), { env: {} });
   const printed = result2.actions.filter((a) => a.action === 'registry-print');
   assert.equal(printed.length, 1);
-  assert.match(printed[0].command, /^reg add "?HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\com\.chromeagentbrowser\.host"? \/ve \/t REG_SZ \/d .*com\.chromeagentbrowser\.host\.json \/f$/);
+  assert.match(printed[0].command, /^reg add "?HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\com\.agentdesk\.host"? \/ve \/t REG_SZ \/d .*com\.agentdesk\.host\.json \/f$/);
   rmSync(tmp2, { recursive: true, force: true });
 });
 
@@ -314,9 +314,9 @@ test('installer: 沙箱安装 chrome 家族 → 清单/shim/host-config 全部�
   const manifestPath = manifestPaths[0];
   assert.ok(existsSync(manifestPath), `manifest missing: ${manifestPath}`);
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
-  assert.equal(manifest.name, 'com.chromeagentbrowser.host');
+  assert.equal(manifest.name, 'com.agentdesk.host');
   assert.equal(manifest.type, 'stdio');
-  assert.equal(manifest.description, 'Chrome Agent Browser native host');
+  assert.equal(manifest.description, 'AgentDesk native host');
   assert.deepEqual(manifest.allowed_origins, [`chrome-extension://${ID_A}/`]);
 
   // shim（v0.2.3）：必须写绝对路径 node——GUI 启动的浏览器没有 shell PATH，裸 node 会 exit 127
@@ -325,7 +325,7 @@ test('installer: 沙箱安装 chrome 家族 → 清单/shim/host-config 全部�
   assert.ok(!/^exec node /m.test(shimContent), 'shim 不得使用裸 node 命令');
   // shim：清单 path 指向它，且带可执行位
   const shimPath = manifest.path;
-  assert.equal(shimPath, path.join(REPO_ROOT, 'host', 'chrome-agent-browser-host'));
+  assert.equal(shimPath, path.join(REPO_ROOT, 'host', 'agentdesk-host'));
   assert.ok(existsSync(shimPath));
   assert.notEqual(statSync(shimPath).mode & 0o111, 0, 'shim must be executable');
   assert.match(shimContent, /^#!\/bin\/sh\nexec \"/); // v0.2.3：exec 后是带引号的绝对路径
@@ -367,7 +367,7 @@ test('installer: 重复安装生成 .bak；--dry-run 不落盘', { timeout: 30_0
   rmSync(home2, { recursive: true, force: true });
 });
 
-test('installer: 拒绝覆盖他人清单（name 不是 com.chromeagentbrowser.host）', { timeout: 30_000 }, async () => {
+test('installer: 拒绝覆盖他人清单（name 不是 com.agentdesk.host）', { timeout: 30_000 }, async () => {
   const home = tmpHome();
   const manifestPath = manifestPathsForFamily('chrome', { home })[0];
   mkdirSync(path.dirname(manifestPath), { recursive: true });
@@ -450,7 +450,7 @@ test('discovery: checkNativeHostManifest 校验已装清单 / 空目录', { time
   const badResult = checkNativeHostManifest('chrome', { home: emptyHome });
   assert.equal(badResult.ok, false);
   assert.ok(badResult.problems.length >= 1);
-  assert.match(badResult.problems[0], /no com\.chromeagentbrowser\.host\.json found/);
+  assert.match(badResult.problems[0], /no com\.agentdesk\.host\.json found/);
 
   rmSync(home, { recursive: true, force: true });
   rmSync(emptyHome, { recursive: true, force: true });

@@ -5,7 +5,7 @@
 //   → 扩展经原生宿主连回服务 → 用 Agent API 全链路操作真页面 → 断言 → 清理。
 //
 // 用法：node test/e2e/run-e2e.mjs [--headed]（默认 --headless=new）
-// 红线：绝不动用户默认 Chrome；清单只写 com.chromeagentbrowser.host.json 且测试后删除；
+// 红线：绝不动用户默认 Chrome；清单只写 com.agentdesk.host.json 且测试后删除；
 //   Chromium 用 playwright 缓存里的 Chrome for Testing + 一次性 user-data-dir。
 
 import { spawn, spawnSync } from 'node:child_process';
@@ -73,7 +73,7 @@ const udd = mkdtempSync(join(tmpdir(), 'ab-e2e-'));
 // 双保险：自定义 user-data-dir 下也放一份清单（Chromium 自定义目录时的查找位置）
 mkdirSync(join(udd, 'NativeMessagingHosts'), { recursive: true });
 const manifest = JSON.parse(readFileSync(writtenManifests[0], 'utf8'));
-writeFileSync(join(udd, 'NativeMessagingHosts/com.chromeagentbrowser.host.json'), JSON.stringify(manifest, null, 2));
+writeFileSync(join(udd, 'NativeMessagingHosts/com.agentdesk.host.json'), JSON.stringify(manifest, null, 2));
 
 // ---- 3. 服务 + 测试页 ----
 // 审计目录也放一次性沙箱（真实扩展/服务走完整线缆，但不往仓库 audit/ 落测试数据）
@@ -239,7 +239,7 @@ try {
       const pages = await browser.tabs.content({ urls: [pageUrl, page2Url] });
       assert.equal(pages.length, 2);
       assert.equal(pages[0].title, 'AB-E2E 测试页');
-      assert.match(pages[0].text, /chrome-agent-browser e2e/, `第一页正文: ${pages[0].text.slice(0, 120)}`);
+      assert.match(pages[0].text, /agentdesk e2e/, `第一页正文: ${pages[0].text.slice(0, 120)}`);
       assert.equal(pages[1].title, 'AB-E2E 第二页');
       assert.match(pages[1].text, /second-marker-9527/, `第二页正文: ${pages[1].text.slice(0, 120)}`);
       // 临时标签已关：第二页不应残留；第一页只剩原本就在的那个 tab
@@ -436,7 +436,7 @@ try {
   try { rmSync(udd, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* Chrome 仍占用则留给系统 */ }
   try { rmSync(SANDBOX_HOME, { recursive: true, force: true }); } catch { /* noop */ }
   for (const p of writtenManifests) { try { rmSync(p, { force: true }); } catch { /* noop */ } }
-  // 终扫：任何残留的 com.chromeagentbrowser.host 清单一律清掉（红线：真实浏览器目录不留痕）
+  // 终扫：任何残留的 com.agentdesk.host 清单一律清掉（红线：真实浏览器目录不留痕）
   let leftover = 0;
   for (const p of writtenManifests) { try { if (existsSync(p)) { leftover++; rmSync(p, { force: true }); } } catch { /* noop */ } }
   if (leftover) console.log(`[e2e] 警告：清理竞态残留 ${leftover} 份清单，已终扫删除`);

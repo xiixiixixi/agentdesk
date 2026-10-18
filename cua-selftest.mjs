@@ -2,19 +2,22 @@
 // cua-selftest.mjs —— 屏幕操作（CUA）交互动全清单自检：探测 →（缺权限则）授权引导 → 编译 → windows →
 // （有授权则）ax-tree + 截图 + 幽魂光标试闪，输出人话报告。
 //
-// 授权引导（v0.5.3；v0.5.4 加悬浮卡片）：缺权限时自动向系统申请（helper 的
-// request-permissions 弹标准系统对话框、把负责进程注册进设置列表），同时自动打开
-// 对应设置面板并浮起琥珀引导卡片（可拖进列表/点 + 号；helper 太旧时静默退化为纯文字），
-// 人话带路，回车推进、Ctrl+C 跳过（跳过即如实降级报告）。
+// 授权引导（v0.5.3 起；v1.0.0 拖拽授权）：缺权限时自动安装 ~/.agentdesk/CUA Helper.app
+// （权限主体，与终端无关），打开系统设置对应面板并浮起 560×124 琥珀引导卡片（贴设置窗
+// 下沿、跟随移动）——把卡片左侧的「CUA Helper」图标拖进列表即完成授权；随后自动检测
+// （1s 轮询，不带 prompt），权限一生效自动收卡、重启 helper 重读授权并继续跑自检链，
+// 无需回车报到（回车=立即验证，Ctrl+C=跳过并如实降级）。.app 装不上时退回 v0.5.3 的
+// 系统标准申请对话框路径。
 //
 // 安全默认：本自检不做任何点击/输入/按键（只读探测 + 截一小块区域 +
 // 屏幕中央闪一次叠加光标——纯可视化，点击穿透、不动任何应用与真鼠标）；
-// 授权申请弹的是 macOS 系统自己的标准对话框，由用户决定是否授予。
+// 授权动作（拖拽/开关）全部由用户在系统设置里亲手完成。
 // 用法：npm run cua-selftest
 // 退出码：探测链路本身能跑通即 0（未授权/未编译等降级项如实报告，不算失败）。
 
 import process from 'node:process';
 import { compileHelper, createCua } from './service/cua.mjs';
+import { ensureCuaHelperApp } from './service/cua-app.mjs';
 import { missingPermissions, permissionGuideText, runGuidedGrant, degradedNote } from './service/cua-guide.mjs';
 
 const log = (s) => console.log(s);
@@ -55,9 +58,9 @@ function makeTtyIo() {
   };
 }
 
-log('chrome-agent-browser 屏幕操作（CUA）自检');
+log('agentdesk 屏幕操作（CUA）自检');
 log('安全说明：本自检只做只读探测与截取一小块画面，不做任何点击/输入/按键；');
-log('          缺权限时会先走系统标准授权申请（弹的是 macOS 自己的对话框，由你决定）。\n');
+log('          缺权限时会引导你把「CUA Helper」拖进系统设置列表（动作由你亲手完成）。\n');
 
 const cua = createCua({});
 try {
@@ -90,19 +93,31 @@ try {
       const st2 = await step('复测能力（编译后 tier 应提升）', () => cua.status());
       if (st2) {
         log(`复测：tier ${st.tier} → ${st2.tier}；辅助功能 ${st2.axGranted === true ? '✓' : '✗/未知'}；屏幕录制 ${st2.screenGranted === true ? '✓' : '✗/未知'}`);
+        st = st2;
       }
     }
   }
 
-  // 2.5 授权引导（v0.5.3）：缺权限时自动向系统申请 + 人话带路（回车推进 / Ctrl+C 跳过）。
-  //     只在交互终端且 helper 已编译时进行（申请走 helper 的 request-permissions）；
-  //     跳过/失败/复测仍缺都如实报告，然后继续只读自检（降级项本来就如实标注）。
+  // 2.2 v1.0.0：装/刷新 CUA Helper.app（权限主体）——已编译就确保 .app 在位且最新；
+  //     装好即结束当前 helper 实例（若此前从裸 CLI 拉起），下一个请求自动从 .app 重启。
+  if (st.supported && st.helperCompiled) {
+    await step('安装 CUA Helper.app（权限主体 ~/.agentdesk/）', () => {
+      const r = ensureCuaHelperApp({});
+      if (!r.installed) throw new Error(r.reason ?? '安装失败');
+      cua.stop(); // 若当前实例是裸 CLI：换到 .app 实例（TCC 按新主体记账）
+      return r.appPath;
+    });
+  }
+
+  // 2.5 授权引导（v1.0.0 拖拽授权）：缺权限时开设置面板 + 浮引导卡片（拖 CUA Helper 进列表）
+  //     + 自动检测生效即重启 helper 继续自检链；回车=立即验证，Ctrl+C=跳过（如实降级）。
+  //     只在交互终端且 helper 已编译时进行；跳过/失败/复测仍缺都如实报告，然后继续只读自检。
   const miss = missingPermissions(st);
   if (st.supported && (miss.ax || miss.screen)) {
     if (!st.helperCompiled) {
       log('');
       log(`⚠ ${permissionGuideText({ responsibleProcess: st.responsibleProcess, ...miss })}`);
-      log('  （自动申请需 A 层助手：跑一次 npm run setup 编译后，重跑本自检即可自动弹系统申请）');
+      log('  （引导需 A 层助手：跑一次 npm run setup 编译后，重跑本自检即可自动拖拽引导）');
     } else {
       const io = makeTtyIo();
       if (!io) {

@@ -338,7 +338,7 @@ test('场景5：第二个 mcp-entry 自动 frontend 模式；service stdin EOF �
       capabilities: {},
       clientInfo: { name: 'multi-frontend-test', version: '0.0.1' },
     });
-    assert.equal(init.result.serverInfo.name, 'chrome-agent-browser');
+    assert.equal(init.result.serverInfo.name, 'agentdesk');
     c2.notify('notifications/initialized');
     const tools = await c2.request('tools/list', {});
     const names = tools.result.tools.map((t) => t.name);
@@ -416,7 +416,7 @@ test('场景5c：service 进程被杀 → 前端进程报错清晰、正常退�
       capabilities: {},
       clientInfo: { name: 'multi-frontend-test', version: '0.0.1' },
     });
-    assert.equal(init.result.serverInfo.name, 'chrome-agent-browser');
+    assert.equal(init.result.serverInfo.name, 'agentdesk');
     c2.notify('notifications/initialized');
 
     // 杀掉 service（SIGKILL，最 harsh 的情况：无优雅关停）

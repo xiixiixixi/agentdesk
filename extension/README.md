@@ -1,16 +1,16 @@
-# Chrome Agent Browser（扩展端）
+# AgentDesk（扩展端）
 
-MV3 单文件 service worker（`background.js`）。它通过 Chrome Native Messaging（每帧一个 JSON）连接本机的 `com.chromeagentbrowser.host` 宿主进程，宿主再把 JSON 原样转发给本机 agent 服务（`127.0.0.1`）。协议定义见仓库根目录的 `shared/protocol.mjs` 与 `docs/PROTOCOL.md`。
+MV3 单文件 service worker（`background.js`）。它通过 Chrome Native Messaging（每帧一个 JSON）连接本机的 `com.agentdesk.host` 宿主进程，宿主再把 JSON 原样转发给本机 agent 服务（`127.0.0.1`）。协议定义见仓库根目录的 `shared/protocol.mjs` 与 `docs/PROTOCOL.md`。
 
 ## 安装（开发者模式加载）
 
 1. 打开 Chrome，地址栏输入 `chrome://extensions` 并回车。
 2. 打开右上角的 **开发者模式**（Developer mode）开关。
 3. 点击左上角 **加载已解压的扩展程序**（Load unpacked）。
-4. 选择本目录（`chrome-agent-browser/extension/`，即包含 `manifest.json` 的目录），确认。
-5. 列表里出现 **Chrome Agent Browser** 即安装成功。修改 `background.js` 后，点击卡片上的刷新图标重新加载。
+4. 选择本目录（`agentdesk/extension/`，即包含 `manifest.json` 的目录），确认。
+5. 列表里出现 **AgentDesk** 即安装成功。修改 `background.js` 后，点击卡片上的刷新图标重新加载。
 
-前提：本机已安装 native host（安装器会写入 `com.chromeagentbrowser.host` 的原生消息清单并启动本机服务）。未安装宿主时扩展会以 1s/2s/5s/10s/30s（封顶）的退避持续重连，控制台（Service worker 链接 → Console）可见 `[ab] transport: ...` 日志。
+前提：本机已安装 native host（安装器会写入 `com.agentdesk.host` 的原生消息清单并启动本机服务）。未安装宿主时扩展会以 1s/2s/5s/10s/30s（封顶）的退避持续重连，控制台（Service worker 链接 → Console）可见 `[ab] transport: ...` 日志。
 
 ## 扩展 ID 怎么来的
 
@@ -37,6 +37,6 @@ MV3 单文件 service worker（`background.js`）。它通过 Chrome Native Mess
 
 ## 隐私说明
 
-- 本扩展**只与本机回环地址通信**：Native Messaging 连接的是本机 `com.chromeagentbrowser.host` 宿主进程，宿主只连 `127.0.0.1` 上的 agent 服务。扩展自身不发起任何对外网络请求（无 fetch/XHR）。
+- 本扩展**只与本机回环地址通信**：Native Messaging 连接的是本机 `com.agentdesk.host` 宿主进程，宿主只连 `127.0.0.1` 上的 agent 服务。扩展自身不发起任何对外网络请求（无 fetch/XHR）。
 - 权限用途：`tabs`/`tabGroups`/`history`/`downloads`/`debugger` 用于命令实现；`storage` 保存实例 ID 与租约；`alarms` 用于断线重连退避；`nativeMessaging` 用于与宿主通信；`host_permissions` 仅用于页面内容操作（定位器注入）。
 - 租约与实例 ID 存放在 `chrome.storage.session` / `chrome.storage.local`，不离开本机；浏览记录查询（`browser_history`）结果也只经本机链路回传给 agent 服务。

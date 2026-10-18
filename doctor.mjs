@@ -37,7 +37,7 @@ check('项目扩展目录 extension/ 存在', () => existsSync(path.join(ROOT, '
 let port = null;
 check('host/host-config.json 存在', () => {
   const p = path.join(ROOT, 'host', 'host-config.json');
-  if (!existsSync(p)) return { ok: false, detail: '没有这份配置说明本机没跑过 npm run setup（扩展的宿主进程不知道往哪拨号）→ 跑 chrome-agent-browser（npm 安装）或 npm run setup（源码）' };
+  if (!existsSync(p)) return { ok: false, detail: '没有这份配置说明本机没跑过 npm run setup（扩展的宿主进程不知道往哪拨号）→ 跑 agentdesk（npm 安装）或 npm run setup（源码）' };
   const cfg = JSON.parse(readFileSync(p, 'utf8'));
   port = cfg.servicePort;
   return { ok: true, detail: `端口 ${cfg.servicePort}` };
@@ -55,7 +55,7 @@ for (const f of families) {
   check(`浏览器 ${f} 的通信清单`, () => {
     const r = checkNativeHostManifest(f);
     if (r.ok) return { ok: true, detail: '已安装且指向本项目的宿主' };
-    return { ok: false, detail: `${r.problems.join('; ')} → chrome-agent-browser -- --browser ${f}（源码：npm run setup -- --browser ${f}）` };
+    return { ok: false, detail: `${r.problems.join('; ')} → agentdesk -- --browser ${f}（源码：npm run setup -- --browser ${f}）` };
   });
 }
 
@@ -63,7 +63,7 @@ const listening = port ? await portListening('127.0.0.1', port) : false;
 if (port) {
   check(`端口 ${port} 有服务在听`, () => listening
     ? { ok: true, detail: '服务在线（MCP 客户端会话或独立服务进程）' }
-    : { ok: false, detail: '当前没有服务进程。判断：你的 AI 客户端 MCP 会话正开着 → 这就是"空列表"的根因，重启会话（或 chrome-agent-browser-mcp / npm run start 手动起服务）；没开会话 → 此项正常（服务按需启动，无需常驻）' });
+    : { ok: false, detail: '当前没有服务进程。判断：你的 AI 客户端 MCP 会话正开着 → 这就是"空列表"的根因，重启会话（或 agentdesk-mcp / npm run start 手动起服务）；没开会话 → 此项正常（服务按需启动，无需常驻）' });
 }
 
 // ---- 屏幕操作（CUA）能力：helper 编译状态 + AX/屏幕录制授权探测 ----
@@ -87,9 +87,9 @@ if (cuaInfo.error) {
 } else {
   const st = cuaInfo.status;
   check('屏幕操作助手编译（host/cua-helper）', () => st.helperCompiled
-    ? { ok: true, detail: `已编译（tier ${st.tier}：A=helper / B=osascript / C=无授权）` }
+    ? { ok: true, detail: `已编译（tier ${st.tier}：A=helper / B=osascript / C=无授权）${st.helperApp ? `；权限主体=${st.helperApp.name}（.app，与终端无关）` : '；未装 CUA Helper.app（权限挂终端，重跑 npm run setup 升级）'}` }
     : { ok: true, detail: st.swiftcAvailable
-      ? '未编译（可选增强）。跑一次 npm run setup 自动编译；当前 B/C 层可用（osascript：元素读/点击/输入；无坐标点击）'
+      ? '未编译（可选增强）。跑一次 npm run setup 自动编译并装 CUA Helper.app；当前 B/C 层可用（osascript：元素读/点击/输入；无坐标点击）'
       : '未编译且本机无 swiftc（装 Xcode 或 xcode-select --install）。当前 B/C 层可用（osascript）' });
   check('CUA 系统授权（辅助功能/屏幕录制）', () => {
     if (st.tier === 'C') return { ok: false, detail: `辅助功能未授权 → 系统设置 → 隐私与安全性 → 辅助功能，勾选运行服务的终端/应用后重跑 doctor（当前仅窗口清单${st.helperCompiled ? '（CGWindowList）' : ''}与截图可用）` };
@@ -98,7 +98,7 @@ if (cuaInfo.error) {
   });
 }
 
-console.log('chrome-agent-browser 体检报告');
+console.log('agentdesk 体检报告');
 for (const [name, r] of items) console.log(`${r.ok ? '✓' : '✗'} ${name}${r.detail ? ' —— ' + r.detail : ''}`);
 const bad = items.filter(([, r]) => !r.ok).length;
 console.log(bad ? `\n总结：${bad} 项异常，按上面每行的"→"建议修复。` : '\n总结：链路健康。若浏览器仍连不上，确认浏览器开着且扩展已从本机项目目录加载（chrome://extensions 无红色报错）。');

@@ -164,7 +164,7 @@ export function installedBrowsers() {
 
 /**
  * 校验某家族的原生宿主清单：
- *   存在 + JSON 合法 + name === com.chromeagentbrowser.host + path 指向存在的文件。
+ *   存在 + JSON 合法 + name === com.agentdesk.host + path 指向存在的文件。
  * 返回 {ok, problems[], manifestPaths, checked[]}。
  */
 export function checkNativeHostManifest(family, { home = os.homedir(), env = process.env } = {}) {

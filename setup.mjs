@@ -17,6 +17,7 @@ import { computeExtensionId, parseArgs as parseInstallArgs, runInstall, FAMILY_N
 import { installedBrowsers } from './installer/discovery.mjs';
 import { ConnectionManager } from './service/connection.mjs';
 import { compileHelper, createCua } from './service/cua.mjs';
+import { ensureCuaHelperApp } from './service/cua-app.mjs';
 import { missingPermissions, showGuideCards } from './service/cua-guide.mjs';
 
 // setup.mjs 位于仓库根，REPO_ROOT 就是它所在目录（此前误用 '..' 多退一级）
@@ -122,9 +123,9 @@ async function main() {
   log('');
   log('⑥ 给 MCP 客户端的配置（复制即用）：');
   log('npm 安装用户（推荐）：');
-  log(JSON.stringify({ mcpServers: { 'chrome-agent-browser': { command: 'chrome-agent-browser-mcp' } } }));
+  log(JSON.stringify({ mcpServers: { agentdesk: { command: 'agentdesk-mcp' } } }));
   log('源码（git clone）用户：');
-  log(JSON.stringify({ mcpServers: { 'chrome-agent-browser': { command: 'node', args: [entry] } } }));
+  log(JSON.stringify({ mcpServers: { agentdesk: { command: 'node', args: [entry] } } }));
 
   // 8. 屏幕操作（CUA）助手：可选增强，编译失败不算安装失败（B 层 osascript 兜底）
   log('');
@@ -132,42 +133,48 @@ async function main() {
   const cua = compileHelper({ log: (m) => log(`   ${m}`) });
   if (cua.compiled) {
     log('   ✓ 已编译 host/cua-helper（A 层：窗口清单 / AX 元素操作 / 定向坐标点击）');
-    // v0.5.3：编译成功即自动探测权限并向系统申请（非交互：弹完对话框打印指引，不等待）
-    // v0.5.4：申请的同时浮起琥珀引导卡片留在屏幕上带路（120 秒后自动淡出）。
-    //   卡片是 helper 进程的窗口——本轮显示过卡片就不 stop helper：本脚本退出后 helper
-    //   随 stdin EOF 留守到卡片全数收起才退（helper 侧保证，寿命封顶 600s）。
+    // v1.0.0：装 CUA Helper.app——TCC 权限挂在这个 .app 上（终端是谁不再重要）。
+    const app = ensureCuaHelperApp({ srcBinary: cua.path, log: (m) => log(`   ${m}`) });
+    if (app.installed) {
+      log(`   ✓ 已安装 ${app.appPath}（权限主体；图标=${app.iconInstalled ? '已装' : '缺'}）`);
+    } else {
+      log(`   - CUA Helper.app 安装失败（${app.reason}）——权限将挂到运行服务的终端上（老行为）。`);
+    }
+    // v1.0.0 非交互引导：不弹系统申请对话框，直接开设置面板 + 浮琥珀引导卡片。
+    //   卡片贴在系统设置窗口下方、跟随移动；左侧大图标拖出的就是 CUA Helper.app 本体，
+    //   拖进列表即完成授权。helper 侧 1.2s 轮询权限，一生效自动收卡（本脚本已退出也
+    //   不影响——卡片是 helper 进程的窗口，stdin EOF 后留守到卡片全数收起才退）。
     const cuaCtx = createCua({});
     let cardsShown = [];
     try {
       const st = await cuaCtx.status();
       const miss = missingPermissions(st);
       if (!miss.ax && !miss.screen) {
-        log('   ✓ 辅助功能与屏幕录制权限均已授予，CUA 全功能就绪');
+        log('   ✓ 辅助功能与屏幕录制权限均已授予（CUA Helper），CUA 全功能就绪');
       } else {
-        const name = st.responsibleProcess || '你的终端';
-        let dialogsPopped = true;
-        try {
-          await cuaCtx.requestPermissions();
-        } catch (err) {
-          dialogsPopped = false;
-          log(`   - 自动申请未完成（${err.message}），请手动到系统设置里勾选：`);
+        const bundled = Boolean(st.helperApp?.path);
+        const name = bundled ? st.helperApp.name : (st.responsibleProcess || '你的终端');
+        if (!bundled) {
+          // 兼容路径（.app 没装上）：向系统标准申请（弹对话框），再浮卡片
+          try { await cuaCtx.requestPermissions(); } catch { /* 弹窗失败不算事：卡片+文字指引兜底 */ }
         }
         cardsShown = await showGuideCards(cuaCtx, miss, name, { log: (m) => log(`   ${m}`) });
         if (cardsShown.length) {
           try { await cuaCtx.openPrivacyPane(miss.ax ? 'accessibility' : 'screen'); } catch { /* 打不开面板不算事：指引里有路径 */ }
         }
         log('');
-        log('   ⚠ 屏幕操作（CUA）需要两个 macOS 权限');
-        log(`   ${dialogsPopped ? '系统刚才弹了授权对话框' : '请手动到系统设置'}，${cardsShown.length ? '屏幕上已出现引导卡片，拖进系统设置列表即可授权；' : '请到系统设置→隐私与安全性 里：'}`);
-        if (!cardsShown.length) {
-          if (miss.ax) log(`     ① 辅助功能 → 勾选「${name}」`);
-          if (miss.screen) log(`     ${miss.ax ? '②' : '①'} 屏幕录制 → 勾选「${name}」`);
+        log('   ⚠ 屏幕操作（CUA）需要两个 macOS 权限（挂在 CUA Helper 上，与终端无关）：');
+        if (cardsShown.length) {
+          log('   系统设置已打开，屏幕上已浮出引导卡片——把卡片左侧的「CUA Helper」图标拖进列表即可；');
+          log('   授权生效后卡片会自动消失（无需回来报到）。也可以点列表下方的 + 号选「CUA Helper」。');
+        } else {
+          if (miss.ax) log(`     ① 辅助功能 → 加入「${name}」`);
+          if (miss.screen) log(`     ${miss.ax ? '②' : '①'} 屏幕录制 → 加入「${name}」`);
         }
-        log('     完成后运行 npm run cua-selftest 验证');
-        log('     （不授权也能用 B 层 osascript 与窗口清单，但没有坐标点击与截图）');
+        log('     完成后可运行 npm run cua-selftest 验证（不授权也能用 B 层 osascript 与窗口清单）');
       }
     } finally {
-      // 留过卡片就不杀 helper（卡片与 helper 共存亡，淡出后 helper 自退）；否则照常收尾
+      // 留过卡片就不杀 helper（卡片与 helper 共存亡；授权后自动收卡、helper 随之自退）；否则照常收尾
       if (!cardsShown.length) cuaCtx.stop();
     }
   } else if (cua.skipped) {
@@ -179,7 +186,7 @@ async function main() {
 
   log('');
   log(ok ? '安装完成 🎉 日常使用：MCP 客户端按上面的配置自动拉起服务即可。' : '安装文件已就位，完成第④步后即用。');
-  log('卸载：chrome-agent-browser-uninstall（npm 安装）或 npm run uninstall（源码）');
+  log('卸载：agentdesk-uninstall（npm 安装）或 npm run uninstall（源码）');
   return ok ? 0 : 1;
 }
 

@@ -3,12 +3,12 @@
 //
 //   - 五家族(chrome/edge/brave/opera/vivaldi) × 三系统(darwin/linux/win32) 的
 //     原生通信清单路径表、清单 JSON 字段、宿主配置文件结构、Windows 注册表策略。
-//   - 全部为逻辑对照重写，未复制其字符串常量；本产品宿主名固定 com.chromeagentbrowser.host。
+//   - 全部为逻辑对照重写，未复制其字符串常量；本产品宿主名固定 com.agentdesk.host。
 //
 // 行为概要：
 //   1. 定位仓库内 host/host.mjs；
 //   2. 生成 shim 可执行脚本（Native Messaging 的 manifest.path 必须指向可执行文件）；
-//   3. 为每个目标浏览器家族写 com.chromeagentbrowser.host.json 清单；
+//   3. 为每个目标浏览器家族写 com.agentdesk.host.json 清单；
 //   4. 把 host-config.json 写进仓库 host/（service 默认 127.0.0.1:7331）；
 //      已存在且是本产品 → 覆盖前备份 .bak。
 
@@ -24,16 +24,16 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 // 常量与家族表
 // ---------------------------------------------------------------------------
 
-export const NATIVE_HOST_NAME = 'com.chromeagentbrowser.host';
+export const NATIVE_HOST_NAME = 'com.agentdesk.host';
 export const MANIFEST_BASENAME = `${NATIVE_HOST_NAME}.json`;
-export const HOST_DESCRIPTION = 'Chrome Agent Browser native host';
+export const HOST_DESCRIPTION = 'AgentDesk native host';
 export const DEFAULT_SERVICE_PORT = 7331;
 export const DEFAULT_SERVICE_HOST = '127.0.0.1';
 export const HOST_CONFIG_BASENAME = 'host-config.json';
 
 // Windows：所有家族共用一个清单缓存目录（相对 HOME），注册表键指向该目录里的清单。
 // 逻辑参考: installManifest.mjs 的 windowsNativeMessaging{manifestDirectory,registryRoot}。
-export const WINDOWS_MANIFEST_DIR_SEGMENTS = ['AppData', 'Local', 'ChromeAgentBrowser', 'NativeMessagingHosts'];
+export const WINDOWS_MANIFEST_DIR_SEGMENTS = ['AppData', 'Local', 'AgentDesk', 'NativeMessagingHosts'];
 
 /**
  * 家族表。每家族按平台给出：
@@ -403,7 +403,7 @@ export async function runInstall(parsed, { platform = process.platform, env = pr
   const extensionIds = parsed.extensionIds.length > 0 ? parsed.extensionIds : defaultExtensionIds(repoRoot);
 
   // shim：清单 path 必须是可执行文件，所以宿主入口包一层脚本。
-  const shimPath = path.join(repoRoot, 'host', platform === 'win32' ? 'chrome-agent-browser-host.cmd' : 'chrome-agent-browser-host');
+  const shimPath = path.join(repoRoot, 'host', platform === 'win32' ? 'agentdesk-host.cmd' : 'agentdesk-host');
   const shimContent = buildShimContent(hostScriptPath, platform);
   const manifest = buildManifest({ extensionIds, hostPath: shimPath });
   const manifestJson = `${JSON.stringify(manifest, null, 2)}\n`;

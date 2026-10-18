@@ -49,6 +49,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 
+import { cuaHelperAppBinaryPath } from './cua-app.mjs';
 import { missingPermissions, permissionGuideText } from './cua-guide.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -507,19 +508,37 @@ export function createCua(opts = {}) {
   const { audit = null, policy = null } = opts;
   const execRunner = typeof opts.execRunner === 'function' ? opts.execRunner : realExec;
   const clock = typeof opts.clock === 'function' ? opts.clock : Date.now;
-  const helperPath = typeof opts.helperPath === 'string' && opts.helperPath ? opts.helperPath : HELPER_PATH;
+  const helperPathOpt = typeof opts.helperPath === 'string' && opts.helperPath ? opts.helperPath : null;
   let helperClient = null;
   let lastEvidence = null; // {action, before, ts}：动作前证据（cua_verify 取后证据配对）
   let lastClick = null; // {x, y, atMs}：最近一次点击位置（type/key 的箭头提示用）
 
+  /**
+   * v1.0.0：默认优先从 ~/.agentdesk/CUA Helper.app 启动 helper——TCC 权限挂在这个 .app 上
+   * （终端是谁不再重要）；.app 不存在时退回仓库 host/cua-helper（裸 CLI，权限归终端）。
+   * 每次取用都重新解析：setup/cua-selftest 中途装好 .app 后，下一个请求自动切过去。
+   */
+  function resolveHelperPath() {
+    if (helperPathOpt) return helperPathOpt;
+    try {
+      const appBin = cuaHelperAppBinaryPath();
+      if (existsSync(appBin)) return appBin;
+    } catch { /* HOME 异常等：退回仓库内二进制 */ }
+    return HELPER_PATH;
+  }
+
   const helperCompiled = () => {
-    try { return existsSync(helperPath); } catch { return false; }
+    try { return existsSync(resolveHelperPath()); } catch { return false; }
   };
 
-  /** 取助手客户端；未编译返回 null。 */
+  /** 取助手客户端；未编译返回 null。路径变化（.app 装好/删掉）时自动换新实例。 */
   function helper() {
-    if (!helperCompiled()) return null;
-    if (!helperClient) helperClient = createHelperClient(helperPath);
+    const bin = resolveHelperPath();
+    if (!existsSync(bin)) return null;
+    if (!helperClient || helperClient.binPath !== bin) {
+      helperClient?.stop();
+      helperClient = createHelperClient(bin);
+    }
     return helperClient;
   }
 
@@ -570,6 +589,8 @@ export function createCua(opts = {}) {
         screenGranted: r.screenGranted === true,
         ...(r.screen?.w && r.screen?.h ? { screen: { w: r.screen.w, h: r.screen.h } } : {}), // 主屏尺寸（自检定位叠加用）
         ...(typeof r.responsibleProcess === 'string' && r.responsibleProcess ? { responsibleProcess: r.responsibleProcess } : {}), // 设置里要勾选的宿主 App 名
+        // v1.0.0：helper 从 .app 内运行 → 权限主体就是该 .app（引导切换为「拖 .app 授权」）
+        ...(r.helperBundle?.path ? { helperApp: { name: r.helperBundle.name ?? 'CUA Helper', path: r.helperBundle.path } } : {}),
       };
     } catch (err) {
       return { axGranted: null, screenGranted: null, reason: err.message };
@@ -585,7 +606,7 @@ export function createCua(opts = {}) {
         supported: false, tier: 'unsupported', platform: process.platform,
         helperCompiled: false, swiftcAvailable: false,
         axGranted: null, screenGranted: null, screen: null,
-        responsibleProcess: null, permissionGuide: null,
+        responsibleProcess: null, helperApp: null, permissionGuide: null,
         overlay: { available: false, enabled: overlayEnabled() },
         capabilities: emptyCaps(), guidance: ['屏幕操作（CUA）仅支持 macOS，本平台不可用'],
       };
@@ -595,6 +616,7 @@ export function createCua(opts = {}) {
     let screenGranted = null;
     let screen = null;
     let responsibleProcess = null;
+    let helperApp = null;
     let probeReason = null;
     if (compiled) {
       const p = await probeViaHelper();
@@ -602,6 +624,7 @@ export function createCua(opts = {}) {
       screenGranted = p?.screenGranted ?? null;
       screen = p?.screen ?? null;
       responsibleProcess = p?.responsibleProcess ?? null;
+      helperApp = p?.helperApp ?? null;
       probeReason = p?.reason ?? null;
     } else {
       axGranted = await probeAxViaOsa();
@@ -623,6 +646,7 @@ export function createCua(opts = {}) {
       axGranted,
       screenGranted,
       responsibleProcess, // TCC 记账的宿主 App 名（设置列表里要勾选的就是它；B/C 层无 helper 时为 null）
+      helperApp, // v1.0.0：helper 从 .app 内运行时 = {name, path}（权限主体是 CUA Helper.app）；裸 CLI = null
       // 人话授权指引（v0.5.4 起为对象）：text=两步说明；card=有无悬浮引导卡片能力（仅 A 层 helper 有窗口）
       permissionGuide: guideText ? { text: guideText, card: compiled } : null,
       ...(screen ? { screen } : {}),
@@ -650,6 +674,32 @@ export function createCua(opts = {}) {
       screenRequested: r.screenRequested === true,
       responsibleProcess: typeof r.responsibleProcess === 'string' && r.responsibleProcess ? r.responsibleProcess : null,
     };
+  }
+
+  /**
+   * 轮询等待权限生效（v1.0.0 授权自动检测的 JS 侧）：每秒经 helper probe（AXIsProcessTrusted
+   * 不带 prompt / CGPreflightScreenCaptureAccess，全只读），全部到位即返回 granted:true。
+   * 用户把 CUA Helper.app 拖进系统设置列表的那一刻，下一拍探测即翻转——无需用户按回车报到。
+   * onPoll 每 3 秒心跳回报一次当前状态（引导层打点用）。
+   */
+  async function waitForGrant({ ax = true, screen = true, timeoutMs = 120_000, intervalMs = 1000, onPoll = null } = {}) {
+    requireMac();
+    const h = helper();
+    if (!h) throw new CuaError('授权等待需要 A 层助手 host/cua-helper（npm run setup 编译）', 'CAPABILITY_UNAVAILABLE');
+    const startedAt = clock();
+    const deadline = startedAt + Math.max(1_000, Math.min(timeoutMs, 600_000));
+    let ticks = 0;
+    for (;;) {
+      const r = await h.request('probe');
+      const axOk = !ax || r.axGranted === true;
+      const screenOk = !screen || r.screenGranted === true;
+      const waitedMs = clock() - startedAt;
+      if (axOk && screenOk) return { granted: true, axGranted: r.axGranted === true, screenGranted: r.screenGranted === true, waitedMs };
+      if (clock() >= deadline) return { granted: false, axGranted: r.axGranted === true, screenGranted: r.screenGranted === true, waitedMs };
+      ticks += 1;
+      if (onPoll && ticks % 3 === 0) onPoll({ axGranted: r.axGranted === true, screenGranted: r.screenGranted === true, waitedMs });
+      await new Promise((res) => setTimeout(res, Math.max(200, intervalMs)));
+    }
   }
 
   /**
@@ -1104,6 +1154,7 @@ export function createCua(opts = {}) {
   return {
     status,
     requestPermissions,
+    waitForGrant,
     showPermissionCard,
     hidePermissionCard,
     openPrivacyPane,
@@ -1147,7 +1198,7 @@ export function registerCuaTools(server, { cua }) {
 
   server.registerTool('cua_status', {
     title: '屏幕操作能力体检',
-    description: '探测屏幕操作（CUA）当前能力层并给授权指引。返回 {tier, axGranted, screenGranted, responsibleProcess, permissionGuide, helperCompiled, swiftcAvailable, overlay, capabilities, guidance}：tier A=编译版助手（最强，坐标可定向投递）/ B=osascript 兜底（无坐标点击）/ C=无授权（仅窗口清单与截图）/ unsupported=非 macOS；responsibleProcess=系统设置里要勾选的终端/应用名，permissionGuide=人话授权指引（v0.5.4 起 {text, card}：text=两步说明，card=有无悬浮引导卡片——申请权限时屏幕上会浮一张可拖进系统设置列表的琥珀卡片）；overlay={available, enabled} 报告幽魂光标叠加（AI 动手位置的琥珀色提示，policy-defaults.json 的 cuaOverlay 可关）。缺权限时首次使用会自动引导授权：npm run cua-selftest（互动引导）或 npm run setup（非交互）会自动向系统申请并一步步带你勾选。首次使用 cua_* 前先跑这个。',
+    description: '探测屏幕操作（CUA）当前能力层并给授权指引。返回 {tier, axGranted, screenGranted, responsibleProcess, helperApp, permissionGuide, helperCompiled, swiftcAvailable, overlay, capabilities, guidance}：tier A=编译版助手（最强，坐标可定向投递）/ B=osascript 兜底（无坐标点击）/ C=无授权（仅窗口清单与截图）/ unsupported=非 macOS；responsibleProcess=系统设置里要勾选的名字；helperApp 非 null 时权限主体是 ~/.agentdesk/CUA Helper.app（引导用户把该 .app 拖进设置列表即完成授权，终端是谁无关）；permissionGuide=人话授权指引（{text, card}：text=两步说明，card=有无悬浮引导卡片）；overlay={available, enabled} 报告幽魂光标叠加（AI 动手位置的琥珀色提示，policy-defaults.json 的 cuaOverlay 可关）。缺权限时首次使用会自动引导授权：npm run cua-selftest（互动引导，拖完卡片自动检测）或 npm run setup（非交互）。首次使用 cua_* 前先跑这个。',
     inputSchema: {},
   }, guard(async () => textResult(await cua.status())));
 

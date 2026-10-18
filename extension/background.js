@@ -1,4 +1,4 @@
-// chrome-agent-browser/extension/background.js
+// agentdesk/extension/background.js
 // MV3 service worker，单文件（no import / no bundler / no third-party libs / ES2020）。
 // 角色：扩展 <--(Chrome Native Messaging)--> host（哑中继）<--(WS)--> service。
 // 命令目录 / 事件 / 错误码 / CDP 白名单的唯一事实来源是 shared/protocol.mjs，
@@ -17,7 +17,7 @@
 // =====================================================================
 
 const PROTOCOL_VERSION = 1;
-const HOST_NAME = 'com.chromeagentbrowser.host'; // native messaging 宿主名（安装器写入的清单一致）
+const HOST_NAME = 'com.agentdesk.host'; // native messaging 宿主名（安装器写入的清单一致）
 const ALARM_RECONNECT = 'ab-reconnect';
 const BACKOFF_MS = [1000, 2000, 5000, 10000, 30000]; // 重连退避，30s 封顶
 const REQ_TIMEOUT_MS = 20000;   // 出站 JSON-RPC 请求超时
@@ -756,12 +756,12 @@ async function cmdBrowserOpenTabs() {
 // 加入/创建 "Agent" 标签组（优先同窗口已有的同名组；失败不影响主流程）
 async function addToAgentGroup(tabId, windowId) {
   try {
-    const groups = await chrome.tabGroups.query({ title: 'Agent' });
+    const groups = await chrome.tabGroups.query({ title: 'AgentDesk' });
     const same = groups.find((g) => g.windowId === windowId);
     const groupId = await chrome.tabs.group(
       same ? { tabIds: [tabId], groupId: same.id } : { tabIds: [tabId], createProperties: { windowId } }
     );
-    if (!same) await chrome.tabGroups.update(groupId, { title: 'Agent', color: 'grey' });
+    if (!same) await chrome.tabGroups.update(groupId, { title: 'AgentDesk', color: 'grey' });
   } catch (e) { log('agent group failed:', errMsg(e)); }
 }
 

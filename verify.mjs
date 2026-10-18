@@ -100,7 +100,7 @@ export async function main(argv = process.argv.slice(2)) {
   const port = resolvePort(args.port);
   const startedAtIso = new Date().toISOString();
 
-  log('chrome-agent-browser 真机验收（npm run verify）');
+  log('agentdesk 真机验收（npm run verify）');
   log(`服务端口 ${port}（host-config）；等浏览器连入窗口 ${args.timeoutSec}s；安全红线：只动自建标签页，CUA 只读 + 中央试闪，结束清理自建页`);
   log('');
 
@@ -121,7 +121,7 @@ export async function main(argv = process.argv.slice(2)) {
         probe.stop();
         ours = true;
       } catch { /* 不是本服务（或握手失败） */ }
-      log(`[verify] 端口 ${port} 已被占用${ours ? '（探测到是本服务：某个 MCP 客户端会话正开着 chrome-agent-browser，请先退出那个会话再验收）' : '（且不是本服务）'}。`);
+      log(`[verify] 端口 ${port} 已被占用${ours ? '（探测到是本服务：某个 MCP 客户端会话正开着 agentdesk，请先退出那个会话再验收）' : '（且不是本服务）'}。`);
       log('[verify] 排查：npm run doctor（端口监听/链路逐项体检）；确认没有别的终端在跑 npm start / 使用中的 MCP 会话。');
       process.exit(1);
     }
