@@ -253,6 +253,8 @@ func axNode(_ el: AXUIElement, _ depth: Int) -> [String: Any] {
     var node: [String: Any] = ["depth": depth]
     if let role = axAttr(el, kAXRoleAttribute) as? String { node["role"] = truncStr(role) }
     if let title = axAttr(el, kAXTitleAttribute) as? String { node["title"] = truncStr(title) }
+    // 描述属性：Finder 侧栏图标等不带标题的元素，标签语义在 AXDescription（2026-10 真机发现）
+    if let desc = axAttr(el, kAXDescriptionAttribute) as? String { node["desc"] = truncStr(desc) }
     if let value = axAttr(el, kAXValueAttribute) {
         if let s = (value as? String), !s.isEmpty { node["value"] = truncStr(s) }
         else if let n = value as? NSNumber { node["value"] = n.doubleValue }
@@ -300,11 +302,15 @@ func cmdAxTree(_ id: Any?, _ p: [String: Any]) {
 // ---------- element-click（AX press 优先，元素 bounds 中心坐标兜底） ----------
 
 /// 深度优先找 role（精确）+ title（给 title 时精确，否则第一个同 role）匹配的元素。
+/// title 匹配语义是「可读标签」：AXTitle 命不中时依次核对 AXDescription（Finder 侧栏图标）
+/// 与 AXValue 字符串（Finder 侧栏行的 AXStaticText 标签在 value，2026-10 真机发现）。
 func axFind(_ el: AXUIElement, _ depth: Int, _ role: String, _ title: String?) -> AXUIElement? {
     if depth > 12 { return nil }
     if let r = axAttr(el, kAXRoleAttribute) as? String, r == role {
         if let want = title {
             if let t = axAttr(el, kAXTitleAttribute) as? String, t == want { return el }
+            if let d = axAttr(el, kAXDescriptionAttribute) as? String, d == want { return el }
+            if let v = axAttr(el, kAXValueAttribute) as? String, v == want { return el }
         } else { return el }
     }
     guard let kids = axAttr(el, kAXChildrenAttribute) as? [AXUIElement] else { return nil }

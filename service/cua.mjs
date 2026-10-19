@@ -1210,7 +1210,7 @@ export function registerCuaTools(server, { cua }) {
 
   server.registerTool('cua_ax_tree', {
     title: '读界面元素清单（无障碍树）',
-    description: '读取目标应用的无障碍树（AI 找「按钮叫什么」用）：节点 {depth, role, title?, value?, bounds?, actions?}。给 app（应用名）或 pid；都不给=前台应用。限额：深度 12、每层 80、总 1500 节点、文本截断 120 字符。配合 cua_click 的 role/title 精确点击，比看截图猜坐标可靠。',
+    description: '读取目标应用的无障碍树（AI 找「按钮叫什么」用）：节点 {depth, role, title?, desc?, value?, bounds?, actions?}。标签可能落在 title/desc/value 任一字段（如 Finder 侧栏行的文字在 value、图标语义在 desc）。给 app（应用名）或 pid；都不给=前台应用。限额：深度 12、每层 80、总 1500 节点、文本截断 120 字符。配合 cua_click 的 role/title 精确点击，比看截图猜坐标可靠。',
     inputSchema: {
       app: z.string().optional().describe('目标应用名（cua_windows 的 ownerName）'),
       pid: z.number().int().optional().describe('目标进程 id（优先于 app）'),
@@ -1238,7 +1238,7 @@ export function registerCuaTools(server, { cua }) {
 
   server.registerTool('cua_click', {
     title: '点击（元素优先，坐标兜底）',
-    description: '两种模式：① 元素 {app|pid, role, title?}——AX 元素动作优先（语义正确），A 层失败自动取元素中心坐标兜底；role/title 来自 cua_ax_tree。② 坐标 {x, y, pid?}——仅 A 层；给 pid 时若目标不前台会先把目标带到前台，再全局注入（进程定向鼠标注入在现代 macOS 已不生效，结果里 fallback:"global" 如实标注；会移动真实光标）；不给 pid 直接全局注入（同样会移动真实光标，慎用）。动作会自动留「前证据」，配合 cua_verify 物理验证；点击位置闪现幽魂光标提示（叠加窗，policy 的 cuaOverlay 可关）。全审计。',
+    description: '两种模式：① 元素 {app|pid, role, title?}——AX 元素动作优先（语义正确），A 层失败自动取元素中心坐标兜底；role/title 来自 cua_ax_tree，title 按「可读标签」匹配：标题命不中依次核对描述与值（Finder 侧栏即靠此命中）。② 坐标 {x, y, pid?}——仅 A 层；给 pid 时若目标不前台会先把目标带到前台，再全局注入（进程定向鼠标注入在现代 macOS 已不生效，结果里 fallback:"global" 如实标注；会移动真实光标）；不给 pid 直接全局注入（同样会移动真实光标，慎用）。动作会自动留「前证据」，配合 cua_verify 物理验证；点击位置闪现幽魂光标提示（叠加窗，policy 的 cuaOverlay 可关）。全审计。',
     inputSchema: {
       app: z.string().optional().describe('元素模式：目标应用名'),
       pid: z.number().int().optional().describe('目标进程 id（元素/坐标模式均可；坐标模式带 pid=目标置前+全局注入，见工具描述）'),

@@ -115,7 +115,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
   const manager = new ConnectionManager({ port: args.port, audit });
   await manager.start();
-  console.log(`[cab-service] listening ws://127.0.0.1:${manager.port} (protocol v1, policy: ${args.policy ?? 'defaults'}; audit: ${audit.disabled ? 'off' : audit.dir})`);
+  console.log(`[agentdesk-service] listening ws://127.0.0.1:${manager.port} (protocol v1, policy: ${args.policy ?? 'defaults'}; audit: ${audit.disabled ? 'off' : audit.dir})`);
   manager.on('browser', (c) => console.log(`[browser] connected ${c.instanceId} (${c.family} ${c.browserVersion ?? ''})${c.restored ? ' [restored]' : ''}`));
   manager.on('browserClosed', (c) => console.log(`[browser] closed ${c.instanceId}; lease mirror retained for reconnect window`));
 
@@ -123,7 +123,7 @@ export async function main(argv = process.argv.slice(2)) {
   const shutdown = async (signal) => {
     if (stopping) return;
     stopping = true;
-    console.log(`[cab-service] ${signal}, shutting down`);
+    console.log(`[agentdesk-service] ${signal}, shutting down`);
     await manager.stop();
     process.exit(0);
   };
@@ -138,7 +138,7 @@ export async function main(argv = process.argv.slice(2)) {
 const invoked = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
 if (invoked) {
   main().then((code) => process.exit(code)).catch((err) => {
-    console.error(`[cab-service] fatal: ${err.message}`);
+    console.error(`[agentdesk-service] fatal: ${err.message}`);
     process.exit(1);
   });
 }
