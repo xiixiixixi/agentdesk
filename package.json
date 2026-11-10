@@ -32,7 +32,12 @@
   },
   "files": [
     "assets/",
-    "extension/",
+    "extension/manifest.json",
+    "extension/background.js",
+    "extension/popup.html",
+    "extension/popup.js",
+    "extension/icons/",
+    "extension/README.md",
     "host/host.mjs",
     "installer/",
     "service/",
