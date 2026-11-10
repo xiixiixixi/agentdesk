@@ -11,16 +11,17 @@ async function getState() {
 }
 
 function render(st) {
+  // 待机 = 服务端明确告诉"另一个浏览器受控"
   const standby = st.enabled !== false && st.connected && st.active === false && !!st.activeLabel;
-  const active = st.enabled !== false && st.active === true;
-  // 互斥：只有"受控中"的浏览器显示开关打开；待机显示为关
+  // 受控 = 服务端点名是我；或服务端还没广播（旧服务/刚连上）时先按"只有我在"乐观处理，
+  // 避免出现"等待受控权分配…"这种让人懵的状态。
+  const active = st.enabled !== false && (st.active === true || (st.connected && !standby));
   $('enabled').checked = active || (st.enabled !== false && !st.connected);
   let text;
   if (st.enabled === false) text = '已关闭：本浏览器不会被 AI 控制';
   else if (active) text = '受控中：AI 可以使用本浏览器';
   else if (standby) text = `待机：${st.activeLabel} 正在受控（勾选可切换过来）`;
-  else if (!st.connected) text = '已启用：等待本地服务（AI 客户端启动时自动连上）';
-  else text = '已启用：等待受控权分配…';
+  else text = '已启用：等待本地服务（AI 客户端启动时自动连上）';
   $('status').textContent = text;
 }
 
