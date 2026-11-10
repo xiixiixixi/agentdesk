@@ -390,14 +390,14 @@ export class ConnectionManager extends EventEmitter {
       const aActive = a.instanceId === this.activeInstanceId ? 1 : 0;
       const bActive = b.instanceId === this.activeInstanceId ? 1 : 0;
       if (aActive !== bActive) return bActive - aActive;
-      return (b.registeredAt || 0) - (a.registeredAt || 0);
+      return (a.registeredAt || 0) - (b.registeredAt || 0); // 无受控信息时：先连上的优先（默认浏览器语义）
     });
   }
 
   /** 重新选举受控浏览器并广播给所有连接（claimTs 最大者胜；无启用者则无人受控）。 */
   _electActive() {
     const eligible = this._rawLive().filter((c) => c.controlEnabled);
-    eligible.sort((a, b) => (b.controlClaimTs - a.controlClaimTs) || ((b.registeredAt || 0) - (a.registeredAt || 0)));
+    eligible.sort((a, b) => (b.controlClaimTs - a.controlClaimTs) || ((a.registeredAt || 0) - (b.registeredAt || 0)));
     const prev = this.activeInstanceId;
     this.activeInstanceId = eligible.length ? eligible[0].instanceId : null;
     this.activeLabel = eligible.length ? eligible[0].label : null;

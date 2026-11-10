@@ -24,7 +24,7 @@ AgentDesk 的浏览器扩展，配合本机 AgentDesk 服务（https://github.co
 - 多浏览器互斥：同一时刻只有你选中的那个浏览器受控
 - 所有动作写入本地审计日志（可在 AI 会话中查询）
 
-安装：先在本机安装 agentdesk（npm i -g agentdesk）并运行 `agentdesk`，再安装本扩展。
+安装：先在本机安装 agentdesk（npm i -g @xiixiixixi/agentdesk）并运行 `agentdesk`，再安装本扩展。
 ```
 
 ## 权限用途说明（审核会逐项看）
@@ -55,5 +55,5 @@ AgentDesk 的浏览器扩展，配合本机 AgentDesk 服务（https://github.co
 ## 审核备注
 
 - 本扩展只是“本地服务的执行体”，不注册任何远程服务器；请在测试说明里附：
-  `npm i -g agentdesk && agentdesk`，然后 Chrome 加载本扩展并运行 `npm run doctor`。
+  `npm i -g @xiixiixixi/agentdesk && agentdesk`，然后 Chrome 加载本扩展并运行 `npm run doctor`。
 - 若审核环境无法运行本机 Node 服务，可注明“扩展单独安装后处于未连接状态，属预期”。

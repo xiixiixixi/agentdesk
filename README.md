@@ -34,7 +34,7 @@
 
 ```bash
 # 1. 全局安装（需要 Node 18+；全局路径固定 → 扩展 ID 稳定，升级不失效）
-npm install -g agentdesk
+npm install -g @xiixiixixi/agentdesk
 
 # 2. 一条命令安装：自动算扩展ID → 写直连配置（token/端口，无需浏览器清单）→ 装 AgentDesk.app
 #    → 打开 Chrome 扩展页（目录路径自动进剪贴板）→ 原地等待验证
@@ -68,13 +68,13 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 > 扩展 ID 由扩展目录的绝对路径决定（Chrome 的规则）。**npm 全局安装的路径固定 → 升级版本 ID 不变**；
 > 源码安装的目录一旦移动就要重跑 setup 重新加载扩展。
 
-卸载：npm 安装用户 `agentdesk-uninstall` 后再 `npm uninstall -g agentdesk`；
+卸载：npm 安装用户 `agentdesk-uninstall` 后再 `npm uninstall -g @xiixiixixi/agentdesk`；
 源码用户 `npm run uninstall`。两者都只删本机直连配置（token/端口）、旧版清单残留与 AgentDesk.app，Chrome 内手动移除扩展即彻底干净。
 
 高级参数：`agentdesk -- --no-open`（不自动开 Chrome）/ `--port N` / `--timeout 秒` /
 `--browser all|chrome|edge|brave|opera|vivaldi|arc` / `--dry-run`（源码用户等价命令 `npm run setup -- …`）。
 
-更新到新版：npm 安装用户 `npm update -g agentdesk`；源码用户 `git pull && npm install`。
+更新到新版：npm 安装用户 `npm update -g @xiixiixixi/agentdesk`；源码用户 `git pull && npm install`。
 两者升级后扩展无需重新加载（ID 不变），但建议重跑一次 setup 刷新配置与 AgentDesk.app。
 
 ## 服务生命周期（常问三问）
