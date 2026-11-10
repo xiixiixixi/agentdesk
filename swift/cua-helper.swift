@@ -8,7 +8,7 @@
 // 命令集（与 service/cua.mjs 的调用侧一一对应）：
 //   probe                              → {axGranted, screenGranted}（AXIsProcessTrusted / CGPreflightScreenCaptureAccess）
 //                                        附 responsibleProcess（TCC 记账的宿主 App 名——用户在系统设置
-//                                        里要勾选的就是这个名字）。v1.0.0：从 CUA Helper.app 内运行时
+//                                        里要勾选的就是这个名字）。v1.0.0：从 AgentDesk.app 内运行时
 //                                        权限挂在本 .app 上（helperBundle 回传 id/name/path，终端是谁
 //                                        不再重要）；裸 CLI 运行时沿 ppid 链推断宿主（通常为终端）。
 //   request-permissions                → 向系统申请辅助功能与屏幕录制权限（各自仅在缺失时申请）：
@@ -49,7 +49,7 @@
 //                                       本项目唯一「可交互」的叠加窗（ignoresMouseEvents=false，
 //                                       但它就是给用户看的引导 UI；仍不抢焦点）。
 //                                       v1.0.0 形态（560×124）：
-//                                       ① 左侧 72px 琥珀大图标=拖拽句柄——从 CUA Helper.app 内运行时
+//                                       ① 左侧 72px 琥珀大图标=拖拽句柄——从 AgentDesk.app 内运行时
 //                                          拖出的就是本 .app 本体（TCC 记账、设置列表要加的正是它）；
 //                                          裸 CLI 运行时退化为拖负责进程（终端）的 .app；
 //                                       ② 贴靠跟随：150ms 轮询 CGWindowListCopyWindowInfo 找系统设置
@@ -135,7 +135,7 @@ func cmdProbe(_ id: Any?, _ p: [String: Any]) {
     if let bid = Bundle.main.bundleIdentifier {
         out["helperBundle"] = [
             "id": bid,
-            "name": (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? "CUA Helper",
+            "name": (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? "AgentDesk",
             "path": Bundle.main.bundleURL.path,
         ] as [String: Any]
     }
@@ -157,14 +157,14 @@ func parentPid(_ pid: pid_t) -> pid_t {
 
 /**
  * 负责进程名（TCC 记账的宿主 App——申请权限时系统弹窗与设置列表里显示的就是它）。
- * v1.0.0 双模式：从 CUA Helper.app 内运行（Bundle.main 带 bundleIdentifier）→ 就是本 .app；
+ * v1.0.0 双模式：从 AgentDesk.app 内运行（Bundle.main 带 bundleIdentifier）→ 就是本 .app；
  * 裸 CLI 运行 → 沿 ppid 链向上找最近的真 App 进程（NSRunningApplication 非 nil 且带
  * bundleIdentifier 的才算——主线程的 NSApplication 会把本 CLI 进程也注册成「app」，
  * 但无 bundle，借此排除）；找不到回退本进程名。
  */
 func responsibleProcessName() -> String {
     if Bundle.main.bundleIdentifier != nil { // 本进程已是个 .app：权限挂在自己身上
-        return (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? "CUA Helper"
+        return (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? "AgentDesk"
     }
     var pid = parentPid(getpid()) // 从父进程起步，跳过被 NSApplication 自注册的本进程
     for _ in 0..<16 { // 链深兜底，防异常成环
@@ -809,13 +809,26 @@ func cmdOverlayHide(_ id: Any?) {
 
 let CARD_W: CGFloat = 560
 let CARD_H: CGFloat = 124
+
+/** 拖拽诊断日志（仅追加到 /tmp，便于定位“拖不进系统设置列表”这类只在真机出现的问题）。 */
+func dragLog(_ msg: String) {
+    let fmt = ISO8601DateFormatter()
+    let line = "\(fmt.string(from: Date())) \(msg)\n"
+    let p = "/tmp/agentdesk-cua-drag.log"
+    let data = Data(line.utf8)
+    if let fh = FileHandle(forWritingAtPath: p) {
+        fh.seekToEndOfFile(); fh.write(data); fh.closeFile()
+    } else {
+        try? data.write(to: URL(fileURLWithPath: p))
+    }
+}
 let CARD_GAP: CGFloat = 20 // 双卡同屏时的纵向错位间距（accessibility 在上、screen 在下）
 let SETTINGS_BUNDLE_ID = "com.apple.systempreferences" // 系统设置（bundleId 跨语言稳定；ownerName 会本地化）
 let CARD_FOLLOW_INTERVAL: TimeInterval = 0.15 // 贴靠跟随轮询：150ms
 let CARD_GRANT_WATCH_INTERVAL: TimeInterval = 1.2 // 授权自动检测轮询（AXIsProcessTrusted 不带 prompt）
 
 /** 负责进程的 .app bundle 路径（拖拽句柄 promise 它——TCC 记账、设置列表要加的正是这个 App）。
- *  v1.0.0：从 CUA Helper.app 内运行时拖出的就是本 .app 本体；裸 CLI 运行走 ppid 链（终端）。 */
+ *  v1.0.0：从 AgentDesk.app 内运行时拖出的就是本 .app 本体；裸 CLI 运行走 ppid 链（终端）。 */
 func responsibleAppBundleURL() -> URL? {
     if Bundle.main.bundleIdentifier != nil { return Bundle.main.bundleURL } // 本进程就是持权 .app
     var pid = parentPid(getpid()) // 与 responsibleProcessName() 同一条 ppid 链
@@ -856,7 +869,7 @@ final class CardCloseButton: NSView {
 
 /**
  * 左侧琥珀大图标 = 拖拽句柄（v1.0.0：72px 大 tile）：按住它发起一次文件拖拽，拖出的就是
- * 「持权 .app」——从 CUA Helper.app 内运行时是本 .app 本体，裸 CLI 时是负责进程（终端）的
+ * 「持权 .app」——从 AgentDesk.app 内运行时是本 .app 本体，裸 CLI 时是负责进程（终端）的
  * .app bundle。用户直接把它放进系统设置 → 隐私与安全性 → 辅助功能/屏幕录制 的列表里
  * （macOS 对拖入的 App 自动建 TCC 条目，效果等同点 + 号再选 App）。fileURL 为 nil（两处都
  * 找不到 .app）时鼠标事件交还父视图，句柄区退化为窗口拖动。拖拽期间经 onDragStateChange
@@ -868,12 +881,26 @@ final class CardIconDragView: NSView, NSDraggingSource {
 
     override var isFlipped: Bool { true }
 
+    /** 卡片常浮在系统设置之上且 App 未激活：允许“第一下点击”直接开始拖拽，不被激活点击吞掉。 */
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     override func resetCursorRects() {
         if fileURL != nil { addCursorRect(bounds, cursor: .openHand) } else { super.resetCursorRects() }
     }
 
+    var appIconImage: NSImage? // .app 内运行时用 App 图标（与新品牌一致）；裸 CLI 回退手绘琥珀光标
+
     override func draw(_ dirtyRect: NSRect) {
-        // 琥珀圆 + 白描边（与扩展角标/幽灵光标/App 图标同色系）
+        if let icon = appIconImage {
+            let r = bounds.insetBy(dx: 1, dy: 1)
+            let clip = NSBezierPath(roundedRect: r, xRadius: r.width * 0.22, yRadius: r.width * 0.22)
+            NSGraphicsContext.saveGraphicsState()
+            clip.addClip()
+            icon.draw(in: r, from: .zero, operation: .sourceOver, fraction: 1)
+            NSGraphicsContext.restoreGraphicsState()
+            return
+        }
+        // 裸 CLI 回退：琥珀圆 + 白描边（与扩展角标/幽灵光标同色系）
         let circle = NSBezierPath(ovalIn: bounds.insetBy(dx: 2.5, dy: 2.5))
         AMBER.setFill()
         circle.fill()
@@ -894,18 +921,35 @@ final class CardIconDragView: NSView, NSDraggingSource {
     }
 
     override func mouseDown(with event: NSEvent) {
-        guard let url = fileURL else { super.mouseDown(with: event); return } // 无可拖对象：退回窗口移动
-        onDragStateChange?(true) // 冻结贴靠跟随：拖拽进行中卡片不得追着鼠标跑
-        let pb = NSPasteboard()
-        pb.clearContents()
-        pb.writeObjects([url as NSURL]) // 磁盘上已存在的 .app：文件 URL 直拖（无需 NSFilePromiseProvider 的惰性承诺）
-        let item = NSDraggingItem(pasteboardWriter: url as NSURL)
-        item.setDraggingFrame(bounds, contents: snapshotImage())
-        beginDraggingSession(with: [item], event: event, source: self)
+        beginAppDrag(with: event)
     }
 
-    /** 拖拽结束（无论 drop 在哪）：解除贴靠冻结。 */
+    /** 发起“把 AgentDesk.app 拖进系统设置列表”的文件拖拽。
+     *  - 同时写 public.file-url 与 legacy NSFilenamesPboardType：后者被新版系统设置的 TCC 列表使用；
+     *  - 拖拽前激活本 App：非激活态下从 nonactivating 面板发起的拖拽在部分 macOS 版本会被取消；
+     *  - 全程写 /tmp/agentdesk-cua-drag.log，拖不动时能直接看到卡在哪一步。 */
+    func beginAppDrag(with event: NSEvent) {
+        guard let url = fileURL else { super.mouseDown(with: event); return }
+        onDragStateChange?(true) // 冻结贴靠跟随：拖拽进行中卡片不得追着鼠标跑
+        dragLog("mouseDown drag=\(url.path)")
+        NSApp.activate(ignoringOtherApps: true)
+        let item = NSPasteboardItem()
+        item.setString(url.absoluteString, forType: .fileURL)
+        item.setPropertyList([url.path], forType: NSPasteboard.PasteboardType("NSFilenamesPboardType"))
+        let dragItem = NSDraggingItem(pasteboardWriter: item)
+        dragItem.setDraggingFrame(bounds, contents: snapshotImage())
+        let session = beginDraggingSession(with: [dragItem], event: event, source: self)
+        session.animatesToStartingPositionsOnCancelOrFail = false
+        dragLog("draggingSession started")
+    }
+
+    func draggingSession(_ session: NSDraggingSession, willBeginAt screenPoint: NSPoint) {
+        dragLog("drag willBegin at \(Int(screenPoint.x)),\(Int(screenPoint.y))")
+    }
+
+    /** 拖拽结束（无论 drop 在哪）：解除贴靠冻结。operation 为空 = 目标没接受（诊断关键）。 */
     func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        dragLog("drag ended at \(Int(screenPoint.x)),\(Int(screenPoint.y)) operation=\(operation.rawValue)")
         onDragStateChange?(false)
     }
 
@@ -929,7 +973,7 @@ final class CardIconDragView: NSView, NSDraggingSource {
  *  用户拖动卡片背景（isMovableByWindowBackground）→ onUserMove → 该卡停止自动贴靠。 */
 class PermissionCardView: NSView {
     let kind: String // accessibility | screen（决定指引指向哪个列表）
-    var appName = "" { didSet { needsDisplay = true } } // 负责进程名（bundled 运行时=CUA Helper）
+    var appName = "" { didSet { needsDisplay = true } } // 负责进程名（bundled 运行时=AgentDesk）
     var onUserMove: (() -> Void)? // 用户手动挪卡：停止贴靠跟随
 
     init(frame frameRect: NSRect, kind: String) {
@@ -941,9 +985,16 @@ class PermissionCardView: NSView {
 
     override var isFlipped: Bool { true }
 
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    /** 整张卡片都是拖拽句柄（✕ 子视图除外）：按住卡片任意位置拖出 AgentDesk.app。
+     *  修复前只有左侧 72px 图标可拖，用户常抓住卡片主体 → 变成挪窗口，往列表里松手无效。 */
     override func mouseDown(with event: NSEvent) {
-        onUserMove?() // 用户要自己挪：停贴靠（再交还系统完成窗口拖动）
-        super.mouseDown(with: event)
+        if let icon = subviews.compactMap({ $0 as? CardIconDragView }).first, icon.fileURL != nil {
+            icon.beginAppDrag(with: event)
+        } else {
+            super.mouseDown(with: event)
+        }
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -960,11 +1011,11 @@ class PermissionCardView: NSView {
         drawText("AgentDesk",
                  in: NSRect(x: textX, y: 22, width: textW, height: 20),
                  [.font: NSFont.boldSystemFont(ofSize: 14), .foregroundColor: NSColor.white])
-        drawText(kind == "accessibility" ? "把左边的图标拖进上面的「辅助功能」列表" : "把左边的图标拖进上面的「屏幕录制」列表",
+        drawText(kind == "accessibility" ? "按住这张卡片，拖进上面的「辅助功能」列表" : "按住这张卡片，拖进上面的「屏幕录制」列表",
                  in: NSRect(x: textX, y: 50, width: textW, height: 18),
                  [.font: NSFont.systemFont(ofSize: 12.5), .foregroundColor: NSColor.white])
-        let name = appName.isEmpty ? "CUA Helper" : appName
-        drawText("松手即完成授权（也可点列表下方的 + 号选「\(name)」）",
+        let name = appName.isEmpty ? "AgentDesk" : appName
+        drawText("拖到列表里松手即完成授权（也可点列表下方的 + 号选「\(name)」）",
                  in: NSRect(x: textX, y: 78, width: textW, height: 16),
                  [.font: NSFont.systemFont(ofSize: 10.5), .foregroundColor: NSColor.white.withAlphaComponent(0.62)])
     }
@@ -1026,7 +1077,7 @@ final class PermissionCardController {
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.ignoresMouseEvents = false // 本项目唯一可交互的叠加窗：它就是给用户操作的引导 UI
-        panel.isMovableByWindowBackground = true // 拖卡片背景 = 挪到列表附近（拖图标句柄 = 拖 App 进列表）
+        panel.isMovableByWindowBackground = false // 整张卡片都可拖出 .app（拖动 = 授予权限，不是挪窗）；位置由贴靠跟随自动摆
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
@@ -1036,6 +1087,8 @@ final class PermissionCardController {
 
         let icon = CardIconDragView(frame: NSRect(x: 18, y: (CARD_H - 72) / 2, width: 72, height: 72))
         icon.fileURL = dragURL
+        icon.appIconImage = Bundle.main.bundleIdentifier != nil ? NSApp.applicationIconImage : nil
+        dragLog("card shown kind=\(kind) drag=\(dragURL?.path ?? "nil") icon=\(icon.appIconImage == nil ? "drawn" : "app")")
         icon.onDragStateChange = { [weak self] on in self?.freezeFollow = on }
         view.addSubview(icon)
         let close = CardCloseButton(frame: NSRect(x: CARD_W - 30, y: 10, width: 20, height: 20))

@@ -1,9 +1,9 @@
 // service/cua-guide.mjs — CUA 授权引导（v0.5.3 起；v0.5.4 悬浮卡片；v1.0.0 拖 .app + 自动检测）
 //
-// v1.0.0 权限模型：helper 装进 ~/.agentdesk/CUA Helper.app（com.agentdesk.cua-helper），
+// v1.0.0 权限模型：helper 装进 ~/.agentdesk/AgentDesk.app（com.agentdesk.cua-helper），
 // TCC 权限挂在这个 .app 上——终端是谁不再重要。引导主路径从「系统弹窗+去设置拨开关」
 // 升级为「拖拽授权」：自动打开系统设置对应面板，屏幕上浮一张 560×124 的琥珀引导卡片
-// （贴在设置窗下沿、跟随移动），卡片左侧大图标按住拖出的就是 CUA Helper.app 本体，
+// （贴在设置窗下沿、跟随移动），卡片左侧大图标按住拖出的就是 AgentDesk.app 本体，
 // 放进列表即完成授权；同时轮询 AXIsProcessTrusted（不带 prompt）自动检测——权限一生效
 // 自动收卡、重启 helper 重读 TCC grant，无需用户回来按回车报到。
 //
@@ -39,7 +39,7 @@ export function missingCardKinds(missing) {
 /** 人话授权指引：含设置面板路径与要勾选/要拖的名字（只列缺的项）。 */
 export function permissionGuideText({ responsibleProcess, ax, screen, appName } = {}) {
   const owner = appName || responsibleProcess;
-  const name = owner || 'CUA Helper（跑一次 npm run setup 会自动装到 ~/.agentdesk/）';
+  const name = owner || 'AgentDesk（跑一次 npm run setup 会自动装到 ~/.agentdesk/）';
   const steps = [];
   if (ax) steps.push(`①「辅助功能」加入/勾选「${name}」（AI 才能读界面元素并点击/输入）`);
   if (screen) steps.push(`${ax ? '②' : '①'}「屏幕录制」加入/勾选「${name}」（AI 才能截图/读到窗口标题）`);
@@ -60,7 +60,7 @@ export async function showGuideCards(cua, missing, appName, { durationSec = CARD
       shown.push(kind);
     } catch { /* 旧版 helper 回 unknown-cmd 等：失败的卡不进列表（调用方据此只收已浮的卡） */ }
   }
-  if (shown.length) log(`屏幕上已出现琥珀色引导卡片（已自动贴在系统设置窗口下方），把卡片左侧的「${appName || 'CUA Helper'}」图标拖进上方列表即可授权`);
+  if (shown.length) log(`屏幕上已出现琥珀色引导卡片（已自动贴在系统设置窗口下方），把卡片左侧的「${appName || 'AgentDesk'}」图标拖进上方列表即可授权`);
   return shown;
 }
 
@@ -112,7 +112,7 @@ async function settleAfterGrant(cua, cards, log) {
 /**
  * 互动授权引导（cua-selftest 用）。v1.0.0 两条路径：
  *   A. helper 从 .app 内运行（st.helperApp 非空，主路径）：不弹系统申请对话框——
- *      直接开面板 + 浮卡片，用户拖 CUA Helper.app 进列表；轮询自动检测（waitForGrant），
+ *      直接开面板 + 浮卡片，用户拖 AgentDesk.app 进列表；轮询自动检测（waitForGrant），
  *      生效即收卡+重启 helper+复测；回车=立即验证，Ctrl+C=跳过。
  *   B. 裸 CLI（无 .app，兼容路径）：v0.5.3 行为——回车后向系统标准申请（弹对话框），
  *      再浮卡片（拖负责进程 .app）+ 开面板，之后同样自动检测收尾。
@@ -136,12 +136,12 @@ export async function runGuidedGrant({ cua, st, io, log = () => {}, recompile = 
   log('');
   log('⚠ 屏幕操作需要两个 macOS 权限，现在帮你开好引导：');
   if (bundled) {
-    log(`   权限主体是「${ownerName}」（~/.agentdesk/CUA Helper.app）——终端是谁无关，授权一次永久生效。`);
+    log(`   权限主体是「${ownerName}」（~/.agentdesk/AgentDesk.app）——终端是谁无关，授权一次永久生效。`);
   }
   if (missing.ax) {
     log('');
     log('第 1 步：辅助功能（让 AI 能看到和点击界面元素）');
-    if (bundled) log('→ 马上会打开系统设置并浮出引导卡片：把卡片左侧的「CUA Helper」图标拖进列表即可');
+    if (bundled) log('→ 马上会打开系统设置并浮出引导卡片：把卡片左侧的「AgentDesk」图标拖进列表即可');
     else {
       log('→ 马上会弹一个系统对话框，点「打开系统设置」');
       log(`→ 在列表里找到「${ownerName}」（或你看到的运行本命令的应用名），打开开关`);
@@ -150,7 +150,7 @@ export async function runGuidedGrant({ cua, st, io, log = () => {}, recompile = 
   if (missing.screen) {
     log('');
     log(`${missing.ax ? '第 2 步' : '第 1 步'}：屏幕录制（让 AI 能截屏）`);
-    log(bundled ? '→ 同一张卡片再拖一次「屏幕录制」列表（或点 + 号选「CUA Helper」）' : '→ 同上：在系统对话框/系统设置里给同一项打开开关');
+    log(bundled ? '→ 同一张卡片再拖一次「屏幕录制」列表（或点 + 号选「AgentDesk」）' : '→ 同上：在系统对话框/系统设置里给同一项打开开关');
   }
   log('');
   if ((await io.ask('[按回车打开系统设置并开始引导…（Ctrl+C 跳过）] ')) === 'skip') return { mode: 'skipped', st, missing };

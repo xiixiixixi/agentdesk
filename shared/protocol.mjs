@@ -31,6 +31,9 @@ export const EV = {
   // 实时投屏帧（v0.4.0）。扩展收到 Page.screencastFrame 已立即 ack，并按 250ms/tab 节流
   // （中间帧丢弃保最新）后转发；data 为 jpeg base64，metadata 只留关键字段摘要。
   SCREENCAST_FRAME: 'onScreencastFrame', // {tabId, data, ts, metadata}
+  // v1.0.1 浏览器"受控权"广播：多浏览器都装了扩展时，服务端只认一个受控实例（互斥）。
+  //   params: {activeInstanceId, activeLabel}；activeInstanceId=null 表示无人受控。
+  CONTROL_STATE: 'onControlState',
 };
 
 // Service -> extension commands. Method name === command type (flat).

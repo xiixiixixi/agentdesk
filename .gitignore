@@ -20,3 +20,10 @@ docs/REFERENCE-MAP.md
 .idea/
 .vscode/
 work/
+
+# 直连配置（setup 生成，含一次性 token）
+extension/runtime-config.json
+
+# 本地逆向分析产物（不入库）
+.codex-analysis/
+.icon-candidates/

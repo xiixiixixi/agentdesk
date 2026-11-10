@@ -51,13 +51,25 @@ const families = (() => {
   return found.length ? [...new Set(found)] : ['chrome'];
 })();
 
-for (const f of families) {
-  check(`浏览器 ${f} 的通信清单`, () => {
-    const r = checkNativeHostManifest(f);
-    if (r.ok) return { ok: true, detail: '已安装且指向本项目的宿主' };
-    return { ok: false, detail: `${r.problems.join('; ')} → agentdesk -- --browser ${f}（源码：npm run setup -- --browser ${f}）` };
-  });
-}
+// v1.0.1：默认直连模式——检查 extension/runtime-config.json（token/端口/扩展 ID 白名单）。
+// 旧方案（native messaging 清单）不再必需，仍装了的话只做提示。
+const runtimeCfgPath = path.join(ROOT, 'extension', 'runtime-config.json');
+check('扩展直连配置 extension/runtime-config.json', () => {
+  if (!existsSync(runtimeCfgPath)) {
+    const legacy = families.some((f) => checkNativeHostManifest(f).ok);
+    return {
+      ok: false,
+      detail: legacy
+        ? '检测到旧版 native messaging 安装 → 重跑 setup 迁移到直连模式（安装更简单，无需清单）'
+        : '没有直连配置 → 跑 agentdesk（npm 安装）或 npm run setup（源码）',
+    };
+  }
+  const cfg = JSON.parse(readFileSync(runtimeCfgPath, 'utf8'));
+  if (!cfg || cfg.mode !== 'ws' || !Number.isInteger(cfg.port) || !cfg.token) return { ok: false, detail: '配置不完整/损坏 → 重跑 setup 重新生成' };
+  if (port && cfg.port !== port) return { ok: false, detail: `端口不一致（配置 ${cfg.port} vs host-config ${port}）→ 重跑 setup 重新生成` };
+  if (!Array.isArray(cfg.extensionIds) || !cfg.extensionIds.length) return { ok: false, detail: '缺少扩展 ID 白名单 → 重跑 setup' };
+  return { ok: true, detail: `直连 ws://127.0.0.1:${cfg.port}（扩展 ID ${cfg.extensionIds.join(',')}）` };
+});
 
 const listening = port ? await portListening('127.0.0.1', port) : false;
 if (port) {
@@ -87,9 +99,9 @@ if (cuaInfo.error) {
 } else {
   const st = cuaInfo.status;
   check('屏幕操作助手编译（host/cua-helper）', () => st.helperCompiled
-    ? { ok: true, detail: `已编译（tier ${st.tier}：A=helper / B=osascript / C=无授权）${st.helperApp ? `；权限主体=${st.helperApp.name}（.app，与终端无关）` : '；未装 CUA Helper.app（权限挂终端，重跑 npm run setup 升级）'}` }
+    ? { ok: true, detail: `已编译（tier ${st.tier}：A=helper / B=osascript / C=无授权）${st.helperApp ? `；权限主体=${st.helperApp.name}（.app，与终端无关）` : '；未装 AgentDesk.app（权限挂终端，重跑 npm run setup 升级）'}` }
     : { ok: true, detail: st.swiftcAvailable
-      ? '未编译（可选增强）。跑一次 npm run setup 自动编译并装 CUA Helper.app；当前 B/C 层可用（osascript：元素读/点击/输入；无坐标点击）'
+      ? '未编译（可选增强）。跑一次 npm run setup 自动编译并装 AgentDesk.app；当前 B/C 层可用（osascript：元素读/点击/输入；无坐标点击）'
       : '未编译且本机无 swiftc（装 Xcode 或 xcode-select --install）。当前 B/C 层可用（osascript）' });
   check('CUA 系统授权（辅助功能/屏幕录制）', () => {
     if (st.tier === 'C') return { ok: false, detail: `辅助功能未授权 → 系统设置 → 隐私与安全性 → 辅助功能，勾选运行服务的终端/应用后重跑 doctor（当前仅窗口清单${st.helperCompiled ? '（CGWindowList）' : ''}与截图可用）` };

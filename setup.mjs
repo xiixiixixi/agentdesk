@@ -1,11 +1,16 @@
 #!/usr/bin/env node
-// setup.mjs —— 一条命令安装：自动算扩展 ID → 检测已装浏览器 → 落清单/配置 →
+// setup.mjs —— 一条命令安装：自动算扩展 ID → 写直连配置（token/端口）→
 // 打开 Chrome 扩展页（路径已进剪贴板）→ 原地等待扩展回连验证 → 打印 MCP 配置。
 //
-// 用法：node setup.mjs [--dry-run] [--port N] [--timeout 秒] [--browser all|chrome|edge|brave|opera|vivaldi] [--home DIR]
+// v1.0.1：默认走「扩展直连本地 service」（WebSocket）——不再写浏览器 native messaging
+// 清单，安装只剩「加载已解压扩展」这一下手动步骤。加 --native-host 可保留旧方案（兼容）。
+//
+// 用法：node setup.mjs [--dry-run] [--port N] [--timeout 秒] [--browser all|chrome|…|vivaldi] [--home DIR] [--native-host]
 // 唯一的手动步：在 Chrome 的「加载已解压的扩展程序」里选中 extension 目录。
 
 import { spawn, spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { once } from 'node:events';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,7 +18,10 @@ import process from 'node:process';
 import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 
-import { computeExtensionId, parseArgs as parseInstallArgs, runInstall, FAMILY_NAMES } from './installer/install.mjs';
+import {
+  computeExtensionId, parseArgs as parseInstallArgs, runInstall, FAMILY_NAMES,
+  manifestPathsForFamily, NATIVE_HOST_NAME,
+} from './installer/install.mjs';
 import { installedBrowsers } from './installer/discovery.mjs';
 import { ConnectionManager } from './service/connection.mjs';
 import { compileHelper, createCua } from './service/cua.mjs';
@@ -28,20 +36,25 @@ const log = (s) => console.log(s);
 const isMac = process.platform === 'darwin';
 
 function parseArgs(argv) {
-  const out = { dryRun: false, port: null, timeoutSec: 240, browser: null, home: null, noOpen: false };
+  const out = { dryRun: false, port: null, timeoutSec: 240, browser: null, home: null, noOpen: false, nativeHost: false };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     const next = () => { const v = argv[++i]; if (v === undefined) throw new Error(`missing value for ${a}`); return v; };
     if (a === '--dry-run') out.dryRun = true;
     else if (a === '--no-open') out.noOpen = true;
+    else if (a === '--native-host') out.nativeHost = true; // 兼容旧方案：写浏览器 native messaging 清单
     else if (a === '--port') out.port = Number(next());
     else if (a === '--timeout') out.timeoutSec = Number(next());
     else if (a === '--browser') out.browser = next();
     else if (a === '--home') out.home = path.resolve(next());
-    else if (a === '--help' || a === '-h') { log('usage: node setup.mjs [--dry-run] [--port N] [--timeout 秒] [--browser all|chrome|…|vivaldi] [--home DIR]'); process.exit(0); }
+    else if (a === '--help' || a === '-h') { log('usage: node setup.mjs [--dry-run] [--port N] [--timeout 秒] [--browser all|chrome|…|vivaldi] [--home DIR] [--native-host]'); process.exit(0); }
     else throw new Error(`unknown argument: ${a}`);
   }
   return out;
+}
+
+function existsSyncSafe(p) {
+  try { return existsSync(p); } catch { return false; }
 }
 
 const freePort = () => new Promise((res, rej) => {
@@ -77,14 +90,56 @@ async function main() {
   }
   if (!port) port = await freePort();
 
-  // 4. 落清单 + shim + host-config（复用已测试的安装器）
-  const installParsed = parseInstallArgs(['--browser', families[0], '--extension-id', extId, '--port', String(port), ...(args.home ? ['--home', args.home] : []), ...(args.dryRun ? ['--dry-run'] : [])]);
-  for (const f of families) {
-    installParsed.browser = f;
-    await runInstall(installParsed);
+  // 4. 落配置：
+  //    默认 → host/host-config.json（端口）+ extension/runtime-config.json（直连 token/端口/扩展 ID）
+  //    --native-host → 走旧安装器写浏览器 native messaging 清单 + shim（兼容）
+  const homeDir = args.home ?? os.homedir();
+  const hostConfigPath = path.join(REPO_ROOT, 'host', 'host-config.json');
+  const runtimeConfigPath = path.join(EXT_DIR, 'runtime-config.json');
+  if (args.nativeHost) {
+    const installParsed = parseInstallArgs(['--browser', families[0], '--extension-id', extId, '--port', String(port), ...(args.home ? ['--home', args.home] : []), ...(args.dryRun ? ['--dry-run'] : [])]);
+    for (const f of families) {
+      installParsed.browser = f;
+      await runInstall(installParsed);
+    }
+    log(`③ ${args.dryRun ? '[dry-run] 将写入' : '已写入'}原生宿主清单（${families.length} 个浏览器）+ 服务配置（端口 ${port}）`);
+  } else {
+    const token = randomBytes(24).toString('hex');
+    const runtimeConfig = {
+      schemaVersion: 1, mode: 'ws', port, token, extensionIds: [extId],
+      updatedAt: new Date().toISOString(),
+      note: 'setup.mjs 生成；扩展直连 ws://127.0.0.1:<port>，不需要浏览器 native messaging 清单',
+    };
+    // 清掉旧安装留下的 native 清单/shim（同机迁移到直连后避免双通道）
+    const cleaned = [];
+    for (const family of families) {
+      for (const p of manifestPathsForFamily(family, { home: homeDir })) {
+        try {
+          if (!existsSyncSafe(p)) continue;
+          const name = JSON.parse(readFileSync(p, 'utf8')).name;
+          if (name !== NATIVE_HOST_NAME) continue;
+          if (!args.dryRun) rmSync(p, { force: true });
+          cleaned.push(p);
+        } catch { /* 解析失败/删不掉就留着，不影响直连 */ }
+      }
+    }
+    for (const f of ['agentdesk-host', 'agentdesk-host.cmd']) {
+      const p = path.join(REPO_ROOT, 'host', f);
+      try { if (existsSyncSafe(p)) { if (!args.dryRun) rmSync(p, { force: true }); cleaned.push(p); } } catch { /* 忽略 */ }
+    }
+    if (args.dryRun) {
+      log(`③ [dry-run] 将写入直连配置：${runtimeConfigPath}（端口 ${port}、扩展 ID ${extId}、token 已生成）`);
+      log(`   [dry-run] 将清理旧 native 清单 ${cleaned.length} 份、写 ${hostConfigPath}`);
+      log('dry-run 结束（未落盘、未启动验证）。');
+      return 0;
+    }
+    mkdirSync(path.dirname(hostConfigPath), { recursive: true });
+    writeFileSync(hostConfigPath, JSON.stringify({ schemaVersion: 1, serviceHost: '127.0.0.1', servicePort: port }, null, 2) + '\n');
+    writeFileSync(runtimeConfigPath, JSON.stringify(runtimeConfig, null, 2) + '\n');
+    log(`③ 已写入直连配置（端口 ${port}、扩展 ID ${extId}、一次性 token）${cleaned.length ? `；清理旧 native 清单 ${cleaned.length} 份` : ''}`);
+    log('   模式：扩展直连 ws://127.0.0.1 —— 不需要浏览器 native messaging 清单（旧方案可用 --native-host 保留）');
   }
-  log(`③ ${args.dryRun ? '[dry-run] 将写入' : '已写入'}原生宿主清单（${families.length} 个浏览器）+ 服务配置（端口 ${port}）`);
-  if (args.dryRun) { log('dry-run 结束（未落盘、未启动验证）。'); return 0; }
+  // 供下方「等待回连」用：runtime config 已落盘，ConnectionManager 启动时会读取同一份 token/白名单
 
   // 5. 助手：打开 Chrome 扩展页 + 扩展路径进剪贴板（macOS）
   log('');
@@ -110,7 +165,7 @@ async function main() {
       manager.once('browser', (c) => { clearTimeout(t); resolve(c); });
     });
     ok = true;
-    log('   ✓ 全链路验证通过：扩展 → 原生宿主 → 服务，通信正常！');
+    log('   ✓ 全链路验证通过：扩展 → 服务（直连 WebSocket），通信正常！');
   } catch {
     log('   ✗ 等待超时。常见原因：还没在 Chrome 里加载扩展 / 加载后又挪动了目录 / 加载的目录不是上面这个路径。');
     log('     完成后随时重跑 node setup.mjs 再验证一次。');
@@ -133,15 +188,15 @@ async function main() {
   const cua = compileHelper({ log: (m) => log(`   ${m}`) });
   if (cua.compiled) {
     log('   ✓ 已编译 host/cua-helper（A 层：窗口清单 / AX 元素操作 / 定向坐标点击）');
-    // v1.0.0：装 CUA Helper.app——TCC 权限挂在这个 .app 上（终端是谁不再重要）。
+    // v1.0.0：装 AgentDesk.app——TCC 权限挂在这个 .app 上（终端是谁不再重要）。
     const app = ensureCuaHelperApp({ srcBinary: cua.path, log: (m) => log(`   ${m}`) });
     if (app.installed) {
       log(`   ✓ 已安装 ${app.appPath}（权限主体；图标=${app.iconInstalled ? '已装' : '缺'}）`);
     } else {
-      log(`   - CUA Helper.app 安装失败（${app.reason}）——权限将挂到运行服务的终端上（老行为）。`);
+      log(`   - AgentDesk.app 安装失败（${app.reason}）——权限将挂到运行服务的终端上（老行为）。`);
     }
     // v1.0.0 非交互引导：不弹系统申请对话框，直接开设置面板 + 浮琥珀引导卡片。
-    //   卡片贴在系统设置窗口下方、跟随移动；左侧大图标拖出的就是 CUA Helper.app 本体，
+    //   卡片贴在系统设置窗口下方、跟随移动；左侧大图标拖出的就是 AgentDesk.app 本体，
     //   拖进列表即完成授权。helper 侧 1.2s 轮询权限，一生效自动收卡（本脚本已退出也
     //   不影响——卡片是 helper 进程的窗口，stdin EOF 后留守到卡片全数收起才退）。
     const cuaCtx = createCua({});
@@ -150,7 +205,7 @@ async function main() {
       const st = await cuaCtx.status();
       const miss = missingPermissions(st);
       if (!miss.ax && !miss.screen) {
-        log('   ✓ 辅助功能与屏幕录制权限均已授予（CUA Helper），CUA 全功能就绪');
+        log('   ✓ 辅助功能与屏幕录制权限均已授予（AgentDesk），CUA 全功能就绪');
       } else {
         const bundled = Boolean(st.helperApp?.path);
         const name = bundled ? st.helperApp.name : (st.responsibleProcess || '你的终端');
@@ -163,10 +218,10 @@ async function main() {
           try { await cuaCtx.openPrivacyPane(miss.ax ? 'accessibility' : 'screen'); } catch { /* 打不开面板不算事：指引里有路径 */ }
         }
         log('');
-        log('   ⚠ 屏幕操作（CUA）需要两个 macOS 权限（挂在 CUA Helper 上，与终端无关）：');
+        log('   ⚠ 屏幕操作（CUA）需要两个 macOS 权限（挂在 AgentDesk 上，与终端无关）：');
         if (cardsShown.length) {
-          log('   系统设置已打开，屏幕上已浮出引导卡片——把卡片左侧的「CUA Helper」图标拖进列表即可；');
-          log('   授权生效后卡片会自动消失（无需回来报到）。也可以点列表下方的 + 号选「CUA Helper」。');
+          log('   系统设置已打开，屏幕上已浮出引导卡片——把卡片左侧的「AgentDesk」图标拖进列表即可；');
+          log('   授权生效后卡片会自动消失（无需回来报到）。也可以点列表下方的 + 号选「AgentDesk」。');
         } else {
           if (miss.ax) log(`     ① 辅助功能 → 加入「${name}」`);
           if (miss.screen) log(`     ${miss.ax ? '②' : '①'} 屏幕录制 → 加入「${name}」`);

@@ -17,8 +17,12 @@
 // =====================================================================
 
 const PROTOCOL_VERSION = 1;
-const HOST_NAME = 'com.agentdesk.host'; // native messaging 宿主名（安装器写入的清单一致）
+const HOST_NAME = 'com.agentdesk.host'; // native messaging 宿主名（仅兼容旧安装；默认已改直连 WS）
+const RUNTIME_CONFIG_PATH = 'runtime-config.json';
+const ENABLED_KEY = 'ab_enabled'; // 弹窗开关：是否允许 AI 控制本浏览器（默认 true）
+const CLAIM_KEY = 'ab_control_claim_ts'; // 受控权竞选时间戳（跨浏览器互斥） // setup 写入 extension/ 下的直连配置（mode/port/token/extensionIds）
 const ALARM_RECONNECT = 'ab-reconnect';
+const ALARM_KEEPALIVE = 'ab-keepalive'; // 30s 周期唤醒：MV3 SW 休眠后自动把 WS 重新连上（直连模式必需）
 const BACKOFF_MS = [1000, 2000, 5000, 10000, 30000]; // 重连退避，30s 封顶
 const REQ_TIMEOUT_MS = 20000;   // 出站 JSON-RPC 请求超时
 const CAPABILITIES = ['cdp', 'screenshot', 'ax', 'locator', 'history', 'downloads', 'dialogs', 'viewport', 'webmcp', 'screencast'];
@@ -60,6 +64,7 @@ const EV = {
   BADGES: 'onBadgeChange',
   WEBMCP_TOOLS: 'onWebmcpTools', // v0.2.1 推送式发现（曾因硬拷贝漏加此行导致静默丢事件——见 test/sync.test.mjs）
   SCREENCAST_FRAME: 'onScreencastFrame', // v0.4.0 实时投屏帧（已 ack + 250ms 节流后转发）
+  CONTROL_STATE: 'onControlState',       // v1.0.1 多浏览器受控权广播（互斥）
 };
 
 // CDP 白名单（硬拷贝 shared/protocol.mjs CDP_ALLOWLIST；tab_cdp_call 默认拒绝）
@@ -87,7 +92,13 @@ const CDP_ALLOWLIST = new Set([
 
 // 运行态（易失；权威数据在 chrome.storage，见文件头注释）
 const st = {
-  port: null,               // 当前 runtime.Port
+  port: null,               // 当前 runtime.Port（native messaging 兼容通道）
+  ws: null,                 // 当前 WebSocket（默认通道：扩展直连本地 service）
+  runtimeCfg: null,         // extension/runtime-config.json 内容（{mode:'ws', port, token, extensionIds}）
+  enabled: true,            // 弹窗开关：false = 本浏览器不接受控制（不连接、不重连）
+  controlClaimTs: 0,        // 最近一次「我要受控」时间戳（多浏览器互斥的竞选依据）
+  activeInstanceId: null,   // 服务端广播的当前受控实例（null=无人；等于自己=本浏览器受控）
+  activeLabel: null,        // 受控实例可读名字（如 "chrome 157"）
   connState: 'disconnected',// connected | reconnecting | disconnected
   reconnectAttempt: 0,      // 0 = 上次连接成功后尚未失败
   nextReqId: 1,             // 出站请求自增 id
@@ -121,14 +132,66 @@ function abErr(code, message, data) {
 function J(v) { return JSON.stringify(v); }
 
 // =====================================================================
-// 【1. 传输层】 native messaging transport + reconnect state machine
+// 【1. 传输层】直连 WebSocket（默认）+ native messaging（兼容旧安装）
+//   - setup 写 extension/runtime-config.json → 走 ws://127.0.0.1:<port>/?token=...
+//   - 没有 runtime-config（老安装 / 商店版尚未配对）→ 退回 native messaging
+//   - 两种通道共用同一套 JSON-RPC 帧与重连状态机
 // =====================================================================
 
 function setConnState(s) { st.connState = s; log('transport:', s); }
+function transportOpen() { return st.ws ? st.ws.readyState === 1 : !!st.port; }
 
-// 立即尝试建立 native messaging 连接；失败路径由 onDisconnect 驱动退避
-function connectTransport() {
-  if (st.port) return;
+/** 读取 extension/runtime-config.json（不存在/非法 → null，退回 native） */
+async function loadRuntimeConfig() {
+  try {
+    const r = await fetch(chrome.runtime.getURL(RUNTIME_CONFIG_PATH), { cache: 'no-store' });
+    if (!r.ok) return null;
+    const cfg = await r.json();
+    if (cfg && cfg.mode === 'ws' && Number.isInteger(cfg.port) && typeof cfg.token === 'string' && cfg.token) return cfg;
+    log('runtime-config invalid, fallback to native');
+    return null;
+  } catch { return null; } // 文件不存在 = 老安装，退回 native messaging
+}
+
+// 立即尝试建立连接；失败路径由 onTransportClosed / scheduleReconnect 驱动退避
+async function connectTransport() {
+  if (!st.enabled) return; // 用户在本浏览器关掉了开关
+  if (st.port || st.ws) return;
+  // 每次重连都重新读配置：端口/token 可能在安装、迁移、E2E 后被重写；
+  // 旧实现缓存一次，会让扩展死磕一个过期端口（真机踩过：E2E 临时端口污染真实 Chrome）。
+  st.runtimeCfg = await loadRuntimeConfig();
+  if (st.runtimeCfg) { connectWebSocket(st.runtimeCfg); return; }
+  connectNativeHost();
+}
+
+/** 默认通道：扩展直连本地 service（无需 native host 清单，安装零配置） */
+function connectWebSocket(cfg) {
+  let ws;
+  try {
+    ws = new WebSocket('ws://127.0.0.1:' + cfg.port + '/?token=' + encodeURIComponent(cfg.token));
+  } catch (e) {
+    log('ws connect threw:', errMsg(e));
+    scheduleReconnect();
+    return;
+  }
+  st.ws = ws;
+  ws.onopen = () => {
+    if (st.ws !== ws) return;
+    st.reconnectAttempt = 0;
+    chrome.alarms.clear(ALARM_RECONNECT).catch(() => {});
+    setConnState('connected');
+    sendHello(); // 每次连上都重新注册（service 重启后也要重新认识我们）
+  };
+  ws.onmessage = (ev) => {
+    try { onFrame(JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data))); }
+    catch (e) { log('ws frame parse failed:', errMsg(e)); }
+  };
+  ws.onclose = () => onTransportClosed(ws);
+  ws.onerror = () => { /* onclose 随后触发，统一在那里重连 */ };
+}
+
+/** 兼容通道：native messaging（旧安装有清单时使用） */
+function connectNativeHost() {
   let port;
   try {
     port = chrome.runtime.connectNative(HOST_NAME);
@@ -139,20 +202,22 @@ function connectTransport() {
   }
   st.port = port;
   port.onMessage.addListener(onFrame);
-  port.onDisconnect.addListener(() => onPortClosed(port));
+  port.onDisconnect.addListener(() => onTransportClosed(port));
   st.reconnectAttempt = 0; // 连接建立成功，退避计数清零
   chrome.alarms.clear(ALARM_RECONNECT).catch(() => {});
   setConnState('connected');
   sendHello(); // 每次连上都重新注册（service 重启后也要重新认识我们）
 }
 
-// 断线：拒绝所有挂起请求；首次断开立即重试，之后按退避表用 chrome.alarms 重试
-function onPortClosed(port) {
-  if (st.port !== port) return; // 过期端口的事件，忽略
+// 断线（WS 或 native）：拒绝所有挂起请求；首次断开立即重试，之后按退避表用 chrome.alarms 重试
+function onTransportClosed(which) {
+  if (st.ws !== which && st.port !== which) return; // 过期通道的事件，忽略
   const lastErr = (chrome.runtime.lastError && chrome.runtime.lastError.message) || '';
+  st.ws = null;
   st.port = null;
-  rejectAllPending('native transport disconnected' + (lastErr ? ': ' + lastErr : ''));
+  rejectAllPending('transport disconnected' + (lastErr ? ': ' + lastErr : ''));
   setConnState('disconnected');
+  if (!st.enabled) return; // 开关已关：不重连
   if (st.reconnectAttempt === 0) {
     st.reconnectAttempt = 1;
     connectTransport(); // 立即重试一次（spec：chrome.alarms + 立即重试）
@@ -162,6 +227,7 @@ function onPortClosed(port) {
 }
 
 function scheduleReconnect() {
+  if (!st.enabled) return;
   st.reconnectAttempt += 1;
   // 下标钳制到 0：首次同步失败时 attempt-2 = -1 会取到 undefined（when=NaN 闹钟建不起来，
   // 重连链死亡）——2026-10-13 真 Chrome 实测复现修复
@@ -193,7 +259,7 @@ function onFrame(msg) {
 // 出站请求：{jsonrpc,id,method,params}，20s 超时；断线即拒
 function sendRequest(method, params) {
   return new Promise((resolve, reject) => {
-    if (!st.port) { reject(new Error('native transport disconnected')); return; }
+    if (!transportOpen()) { reject(new Error('transport disconnected')); return; }
     const id = st.nextReqId++;
     const timer = setTimeout(() => {
       st.pending.delete(id);
@@ -210,8 +276,10 @@ function sendNotification(method, params) {
 }
 
 function postFrame(obj) {
-  if (!st.port) return;
-  try { st.port.postMessage(obj); } catch (e) { log('postMessage failed:', errMsg(e)); }
+  try {
+    if (st.ws && st.ws.readyState === 1) { st.ws.send(JSON.stringify(obj)); return; }
+    if (st.port) { st.port.postMessage(obj); }
+  } catch (e) { log('postFrame failed:', errMsg(e)); }
 }
 
 function rejectAllPending(reason) {
@@ -250,6 +318,13 @@ function detectBrowserVersion() {
   return m ? m[1] : '';
 }
 
+/** 给用户看的浏览器名（"正在被谁使用"提示）。Arc 的 UA 与 Chrome 同构，显示为 chrome+主版本。 */
+function browserLabel() {
+  const fam = detectFamily();
+  const ver = detectBrowserVersion().split('.')[0];
+  return ver ? fam + ' ' + ver : fam;
+}
+
 async function sendHello() {
   try {
     sendNotification(EV.HELLO, {
@@ -259,6 +334,8 @@ async function sendHello() {
       userAgent: navigator.userAgent,
       capabilities: CAPABILITIES.slice(),
       protocol: PROTOCOL_VERSION,
+      // 受控权竞选：多浏览器同时开扩展时，服务端按 claimTs 选一个受控（互斥）
+      control: { enabled: st.enabled, claimTs: st.controlClaimTs, label: browserLabel() },
     });
   } catch (e) { log('sendHello failed:', errMsg(e)); }
 }
@@ -754,15 +831,26 @@ async function cmdBrowserOpenTabs() {
 // ---- 标签页生命周期 ----
 
 // 加入/创建 "Agent" 标签组（优先同窗口已有的同名组；失败不影响主流程）
+// tab 分组是“锦上添花”：Arc 等非标准 Chromium 上 chrome.tabGroups.* 可能永远不 settle，
+// 曾导致 tab_create 整条命令挂起（真机踩过）。加 1.5s 超时，超时就跳过分组，命令照常返回。
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout: ' + label)), ms)),
+  ]);
+}
+
 async function addToAgentGroup(tabId, windowId) {
   try {
-    const groups = await chrome.tabGroups.query({ title: 'AgentDesk' });
-    const same = groups.find((g) => g.windowId === windowId);
-    const groupId = await chrome.tabs.group(
-      same ? { tabIds: [tabId], groupId: same.id } : { tabIds: [tabId], createProperties: { windowId } }
-    );
-    if (!same) await chrome.tabGroups.update(groupId, { title: 'AgentDesk', color: 'grey' });
-  } catch (e) { log('agent group failed:', errMsg(e)); }
+    await withTimeout((async () => {
+      const groups = await chrome.tabGroups.query({ title: 'AgentDesk' });
+      const same = groups.find((g) => g.windowId === windowId);
+      const groupId = await chrome.tabs.group(
+        same ? { tabIds: [tabId], groupId: same.id } : { tabIds: [tabId], createProperties: { windowId } }
+      );
+      if (!same) await chrome.tabGroups.update(groupId, { title: 'AgentDesk', color: 'grey' });
+    })(), 1500, 'tabGroups');
+  } catch (e) { log('agent group skipped:', errMsg(e)); }
 }
 
 async function cmdTabCreate(p) {
@@ -1505,6 +1593,7 @@ async function handleInbound(msg) {
       chrome.storage.session.remove(SESSION_KEY).catch(() => {});
       return;
     }
+    if (msg.method === EV.CONTROL_STATE && id === undefined) { onControlState(msg.params || {}); return; } // 服务端互斥广播
     const entry = REGISTRY[msg.method];
     if (!entry) {
       if (id === undefined) return; // 未知通知：忽略（不能回错误）
@@ -1688,9 +1777,109 @@ const readyPromise = initState();
 
 // 重连闹钟：SW 可能被杀，闹钟是重试的持久载体
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name !== ALARM_RECONNECT) return;
-  if (st.port) return; // 已连上（竞态保护）
-  connectTransport();
+  if (!st.enabled) return; // 开关关闭：所有闹钟都只保持静默
+  if (alarm.name === ALARM_RECONNECT) {
+    if (transportOpen()) return; // 已连上（竞态保护）
+    connectTransport();
+    return;
+  }
+  // v1.0.1 直连保活：MV3 SW 空闲会被 Chrome 回收，连接与重连状态一起消失；
+  // 周期闹钟每 30s 把 SW 叫醒，发现没连上就重连（服务重启/浏览器重启后自动归位）。
+  if (alarm.name === ALARM_KEEPALIVE) {
+    if (st.enabled && !transportOpen()) connectTransport();
+  }
 });
 
-connectTransport(); // SW 启动立即尝试连接
+// 浏览器启动 / 扩展安装/更新：立即尝试连接
+try { chrome.runtime.onStartup.addListener(async () => { await loadEnabled(); if (st.enabled) connectTransport(); }); } catch { /* 非扩展环境兜底 */ }
+try { chrome.runtime.onInstalled.addListener(async () => { await loadEnabled(); ensureKeepalive(); if (st.enabled) connectTransport(); }); } catch { /* 同上 */ }
+
+/** 主动断开当前通道（弹窗关开关时用）：清闹钟、关连接、拒挂起请求，不触发重连。 */
+function disconnectTransport() {
+  try { chrome.alarms.clear(ALARM_RECONNECT); } catch { /* noop */ }
+  rejectAllPending('disabled by user');
+  const ws = st.ws, port = st.port;
+  st.ws = null; st.port = null;
+  try { if (ws) ws.close(); } catch { /* noop */ }
+  try { if (port) port.disconnect(); } catch { /* noop */ }
+  setConnState('disconnected');
+  updateActionTitle();
+}
+
+/** 弹窗开关落盘读取（缺省 true = 老用户升级后行为不变） */
+async function loadEnabled() {
+  try {
+    const got = await chrome.storage.local.get([ENABLED_KEY, CLAIM_KEY]);
+    st.enabled = got[ENABLED_KEY] !== false;
+    st.controlClaimTs = Number(got[CLAIM_KEY]) || 0;
+  } catch { st.enabled = true; }
+}
+
+function updateActionTitle() {
+  let title = 'AgentDesk（已关闭）';
+  if (st.enabled) {
+    if (st.activeInstanceId && st.instanceId && st.activeInstanceId !== st.instanceId) {
+      title = 'AgentDesk（待机：' + (st.activeLabel || '另一个浏览器') + ' 受控中）';
+    } else if (st.activeInstanceId === st.instanceId) {
+      title = 'AgentDesk（受控中）';
+    } else {
+      title = 'AgentDesk（已启用，等待连接）';
+    }
+  }
+  try { chrome.action.setTitle({ title }); } catch { /* noop */ }
+}
+
+// 弹窗消息：状态查询 / 开关切换
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (!msg || typeof msg !== 'object') return undefined;
+  if (msg.type === 'ab_popup_status') {
+    sendResponse({
+      enabled: st.enabled,
+      connected: transportOpen(),
+      state: st.connState,
+      active: !!(st.activeInstanceId && st.instanceId && st.activeInstanceId === st.instanceId),
+      activeLabel: st.activeLabel,
+    });
+    return undefined;
+  }
+  if (msg.type === 'ab_set_enabled') {
+    const next = msg.enabled !== false;
+    st.enabled = next;
+    const patch = { [ENABLED_KEY]: next };
+    if (next) { st.controlClaimTs = Date.now(); patch[CLAIM_KEY] = st.controlClaimTs; } // 打开=竞选受控权
+    chrome.storage.local.set(patch).catch(() => {});
+    if (!next) {
+      st.activeInstanceId = null; st.activeLabel = null;
+      disconnectTransport();
+    } else if (transportOpen()) {
+      sendHello(); // 已连接：重发 hello，服务端按新 claimTs 重新选举
+    } else {
+      st.reconnectAttempt = 0;
+      connectTransport();
+    }
+    updateActionTitle();
+    sendResponse({ ok: true, enabled: next });
+    return undefined;
+  }
+  return undefined;
+});
+
+/** 服务端广播的受控权变化：更新本地状态 + 工具栏标题（待机/受控）。 */
+function onControlState(p) {
+  st.activeInstanceId = (p && p.activeInstanceId) || null;
+  st.activeLabel = (p && p.activeLabel) || null;
+  updateActionTitle();
+}
+
+/** 确保 30s 周期保活闹钟存在（幂等；已存在时 create 会覆盖同 period 的旧闹钟，代价可忽略） */
+function ensureKeepalive() {
+  try { chrome.alarms.create(ALARM_KEEPALIVE, { periodInMinutes: 0.5 }); } catch (e) { log('keepalive alarm failed:', errMsg(e)); }
+}
+
+(async function bootstrap() {
+  await loadEnabled();
+  try { await readyPromise; } catch { /* 状态重建失败不影响连接 */ }
+  ensureKeepalive();
+  updateActionTitle();
+  if (st.enabled) connectTransport(); // SW 启动立即尝试连接（开关关掉时不连）
+})();

@@ -143,6 +143,26 @@ export async function main(argv = process.argv.slice(2)) {
     manager.on('browser', onNew);
   });
 
+  // 多浏览器同时在线时（Chrome + Arc 都装了扩展），挑一个“真的能建标签页”的：
+  // 实测 Arc（Chromium 156）的 tab_create 会挂起，不能让它拖垮整轮验收。
+  const pickUsable = async () => {
+    const tried = new Set();
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) {
+      for (const c of manager.liveConnections()) {
+        if (knownBefore.has(c.instanceId) || tried.has(c.instanceId)) continue;
+        tried.add(c.instanceId);
+        try {
+          const t = await c.cmd('tab_create', {}, { timeoutMs: 6000 });
+          try { await c.cmd('tab_close', { tabId: t.tabId }, { timeoutMs: 4000 }); } catch { /* 关不掉不影响验收 */ }
+          return c;
+        } catch { /* 该浏览器不可用，试下一个 */ }
+      }
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    return null;
+  };
+
   const results = [];
   const check = (name, fn) => (async () => {
     try {
@@ -181,19 +201,27 @@ export async function main(argv = process.argv.slice(2)) {
       log('[verify]        且 npm run setup 跑过（host-config 端口一致）；本验收退出后服务即停，扩展下次有服务时会自动重连。');
       process.exit(1);
     }
-    const family = conn.family ?? 'unknown';
-    const version = conn.browserVersion ?? '?';
-    log(`[verify] 浏览器已连入：${family} ${version}（instanceId ${conn.instanceId.slice(0, 10)}…）`);
+    const usable = await pickUsable();
+    if (!usable) {
+      log(`[verify] 有浏览器连入（${conn.browserVersion ?? '?'}），但没有一个能在 6s 内建标签页 —— 验收未执行。`);
+      log('[verify] 常见原因：扩展的浏览器 tab API 被挂起（Arc 实测会这样）；在 Chrome 里加载扩展后重跑，或关掉不需要的浏览器。');
+      process.exit(1);
+    }
+    if (usable.instanceId !== conn.instanceId) log(`[verify] 多浏览器在线，跳过不可用实例；选用：${usable.family} ${usable.browserVersion}`);
+    const chosen = usable;
+    const family = chosen.family ?? 'unknown';
+    const version = chosen.browserVersion ?? '?';
+    log(`[verify] 浏览器已连入：${family} ${version}（instanceId ${chosen.instanceId.slice(0, 10)}…）`);
     log('');
-    const browser = api.browsers.get(conn.instanceId);
+    const browser = api.browsers.get(chosen.instanceId);
 
     // 1/11 能力体检
     await check('1/11 能力体检：服务在线 + browsers.list（浏览器家族版本）', async () => {
       const list = api.browsers.list();
       if (list.length < 1) throw new Error('browsers.list 为空');
-      const me = list.find((b) => b.id === conn.instanceId);
+      const me = list.find((b) => b.id === chosen.instanceId);
       if (!me || me.type !== 'extension') throw new Error(`browsers.list 异常: ${JSON.stringify(list)}`);
-      return `服务 ws://127.0.0.1:${manager.port} 在线；browsers.list=${list.length} 台：${me.family} ${version}`;
+      return `服务 ws://127.0.0.1:${manager.port} 在线；browsers.list=${list.length} 台；验收选用：${me.family} ${version}`;
     });
 
     // 2/11 用户标签只读

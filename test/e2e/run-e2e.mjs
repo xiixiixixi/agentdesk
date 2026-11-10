@@ -2,7 +2,7 @@
 // test/e2e/run-e2e.mjs —— 端到端联测：真 Chromium(Chrome for Testing) + 真扩展 + 真宿主 + 真服务。
 //
 // 流程：起服务(随机端口) → 安装器写清单(带本仓库扩展的真实ID) → 无头 Chromium 加载扩展
-//   → 扩展经原生宿主连回服务 → 用 Agent API 全链路操作真页面 → 断言 → 清理。
+//   → 扩展经直连 WebSocket 连回服务 → 用 Agent API 全链路操作真页面 → 断言 → 清理。
 //
 // 用法：node test/e2e/run-e2e.mjs [--headed]（默认 --headless=new）
 // 红线：绝不动用户默认 Chrome；清单只写 com.agentdesk.host.json 且测试后删除；
@@ -48,7 +48,7 @@ function freePort() {
   });
 }
 
-// ---- 1. 端口与安装 ----
+// ---- 1. 端口 + 扩展 ID + 临时直连配置 ----
 const port = await freePort();
 const compute = spawnSync('node', [join(ROOT, 'installer/install.mjs'), '--compute-extension-id', EXT_DIR], { encoding: 'utf8' });
 assert.equal(compute.status, 0, `compute-extension-id 失败: ${compute.stderr}`);
@@ -56,24 +56,20 @@ const extId = (compute.stdout.match(/[a-p]{32}/) || [])[0];
 assert.ok(extId, '无法解析扩展 ID');
 console.log(`[e2e] 扩展 ID = ${extId}（来自路径哈希），服务端口 = ${port}`);
 
-// 保护用户真实配置（顺序关键：必须在安装器跑之前读原值，安装器会重写它）
+// 保护用户真实配置（顺序关键：E2E 会临时覆盖 extension/runtime-config.json，结束还原）
 const hostConfigPath = join(ROOT, 'host', 'host-config.json');
 const hostConfigBackup = existsSync(hostConfigPath) ? readFileSync(hostConfigPath, 'utf8') : null;
-
-// E2E 沙箱 HOME：清单全部写进沙箱（真实浏览器目录零接触）；Chrome 实际读的是
-// 下方 user-data-dir 里的那份副本（自定义 user-data-dir 时 Chromium 的查找位置）
-const SANDBOX_HOME = mkdtempSync(join(tmpdir(), 'ab-e2e-home-'));
-const install = spawnSync('node', [join(ROOT, 'installer/install.mjs'), '--browser', 'chrome', '--extension-id', extId, '--port', String(port), '--home', SANDBOX_HOME], { encoding: 'utf8' });
-assert.equal(install.status, 0, `安装器失败: ${install.stderr}${install.stdout}`);
-const writtenManifests = (install.stdout.match(/^WRITE-MANIFEST .+$/gm) || []).map((l) => l.slice('WRITE-MANIFEST '.length).trim());
-console.log(`[e2e] 安装器写入 ${writtenManifests.length} 份清单（沙箱 ${SANDBOX_HOME}）`);
+const runtimeCfgPath = join(EXT_DIR, 'runtime-config.json');
+const runtimeCfgBackup = existsSync(runtimeCfgPath) ? readFileSync(runtimeCfgPath, 'utf8') : null;
+const testToken = 'e2e-token-' + Math.random().toString(16).slice(2) + Date.now().toString(16);
+writeFileSync(runtimeCfgPath, JSON.stringify({
+  schemaVersion: 1, mode: 'ws', port, token: testToken, extensionIds: [extId],
+  updatedAt: new Date().toISOString(),
+}, null, 2) + '\n');
+console.log(`[e2e] 已写入临时直连配置（扩展 ID ${extId}，端口 ${port}，token 已生成）`);
 
 // ---- 2. 一次性浏览器环境 ----
 const udd = mkdtempSync(join(tmpdir(), 'ab-e2e-'));
-// 双保险：自定义 user-data-dir 下也放一份清单（Chromium 自定义目录时的查找位置）
-mkdirSync(join(udd, 'NativeMessagingHosts'), { recursive: true });
-const manifest = JSON.parse(readFileSync(writtenManifests[0], 'utf8'));
-writeFileSync(join(udd, 'NativeMessagingHosts/com.agentdesk.host.json'), JSON.stringify(manifest, null, 2));
 
 // ---- 3. 服务 + 测试页 ----
 // 审计目录也放一次性沙箱（真实扩展/服务走完整线缆，但不往仓库 audit/ 落测试数据）
@@ -136,7 +132,7 @@ try {
   // 会在安装器改写 host-config 端口期间抢先注册。只认"启动我们的 Chromium 之后才新出现"
   // 的浏览器，启动前已在线的一律忽略。
   const knownBefore = new Set(manager.liveConnections().map((c) => c.instanceId));
-  await step('扩展经原生宿主连入服务（ext/hello 注册）', async () => {
+  await step('扩展直连 WebSocket 连入服务（ext/hello 注册）', async () => {
     const got = new Promise((res) => manager.on('browser', function onNew(c) {
       if (!knownBefore.has(c.instanceId)) { manager.off('browser', onNew); res(c); }
     }));
@@ -434,18 +430,17 @@ try {
   await manager.stop().catch(() => {});
   httpServer.close();
   try { rmSync(udd, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch { /* Chrome 仍占用则留给系统 */ }
-  try { rmSync(SANDBOX_HOME, { recursive: true, force: true }); } catch { /* noop */ }
-  for (const p of writtenManifests) { try { rmSync(p, { force: true }); } catch { /* noop */ } }
-  // 终扫：任何残留的 com.agentdesk.host 清单一律清掉（红线：真实浏览器目录不留痕）
-  let leftover = 0;
-  for (const p of writtenManifests) { try { if (existsSync(p)) { leftover++; rmSync(p, { force: true }); } } catch { /* noop */ } }
-  if (leftover) console.log(`[e2e] 警告：清理竞态残留 ${leftover} 份清单，已终扫删除`);
-  // 还原用户真实 host-config（安装器在测试中重写了端口）
+  // 还原用户真实直连配置（E2E 临时覆盖过）；原本没有则删掉测试文件
+  try {
+    if (runtimeCfgBackup !== null) writeFileSync(runtimeCfgPath, runtimeCfgBackup);
+    else if (existsSync(runtimeCfgPath)) rmSync(runtimeCfgPath, { force: true });
+  } catch { /* noop */ }
+  // 还原用户真实 host-config
   if (hostConfigBackup !== null) writeFileSync(hostConfigPath, hostConfigBackup);
   // 钥匙串测试凭据清理（红线：不留残留；remove 幂等，未存时静默）
   try { await realCredentials.remove(loginOrigin); } catch { /* noop */ }
   try { rmSync(AUDIT_DIR, { recursive: true, force: true }); } catch { /* noop */ }
-  console.log(`[e2e] 清理完成（浏览器/服务/测试页/临时目录/钥匙串测试凭据/${writtenManifests.length} 份清单）`);
+  console.log('[e2e] 清理完成（浏览器/服务/测试页/临时目录/钥匙串测试凭据/直连配置已还原）');
 }
 
 const failed = results.filter(([, e]) => e);

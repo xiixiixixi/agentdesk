@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; font: 13px/1.4 -apple-system, system-ui, sans-serif; }
+  .card { width: 280px; padding: 14px; }
+  .row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .row img { width: 20px; height: 20px; border-radius: 4px; }
+  .row strong { font-size: 14px; }
+  .line { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .label { font-weight: 600; }
+  .status { margin-top: 8px; opacity: .75; font-size: 12px; }
+  .hint { margin-top: 10px; opacity: .55; font-size: 11px; }
+  .switch { position: relative; width: 42px; height: 24px; flex: none; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider { position: absolute; inset: 0; background: #b9bec7; border-radius: 12px; transition: .15s; cursor: pointer; }
+  .slider::before { content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: .15s; }
+  input:checked + .slider { background: #f59e0b; }
+  input:checked + .slider::before { transform: translateX(18px); }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="row"><img src="icons/icon32.png" alt=""><strong>AgentDesk</strong></div>
+  <div class="line">
+    <span class="label">允许 AI 控制本浏览器</span>
+    <label class="switch"><input type="checkbox" id="enabled"><span class="slider"></span></label>
+  </div>
+  <div id="status" class="status">读取状态…</div>
+  <div class="hint">装了两个浏览器时，只保留你要被控制的那个开着；关掉的不再连接本地服务。</div>
+</div>
+<script src="popup.js"></script>
+</body>
+</html>

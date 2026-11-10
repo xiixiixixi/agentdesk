@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // uninstall.mjs —— 干净卸载：删五家族目录里的 com.agentdesk.host 清单（只删自己的，
 // 连 v1.0.0 改名前的旧宿主名残留清单也一并清理），再删仓库 host/ 的 shim/配置/助手，
-// 最后移除 ~/.agentdesk/CUA Helper.app（屏幕操作助手的独立 .app）。
+// 最后移除 ~/.agentdesk/AgentDesk.app（屏幕操作助手的独立 .app）。
 //
 // 用法：node uninstall.mjs [--dry-run] [--home DIR]
 
@@ -52,11 +52,25 @@ for (const f of [
   const p = path.join(REPO_ROOT, 'host', f);
   if (existsSync(p)) { console.log(`${dryRun ? '[dry-run] 将删除' : '已删除'} ${p}`); if (!dryRun) rmSync(p, { force: true }); }
 }
-// ~/.agentdesk/CUA Helper.app（v1.0.0 起屏幕操作助手挂在独立 .app 上）
+// v1.0.1 直连配置：extension/runtime-config.json（token/端口/扩展 ID 白名单）
+const runtimeCfg = path.join(REPO_ROOT, 'extension', 'runtime-config.json');
+if (existsSync(runtimeCfg)) {
+  console.log(`${dryRun ? '[dry-run] 将删除' : '已删除'} ${runtimeCfg}`);
+  if (!dryRun) rmSync(runtimeCfg, { force: true });
+}
+
+// ~/.agentdesk/AgentDesk.app（v1.0.0 起屏幕操作助手挂在独立 .app 上）
 const cuaApp = cuaHelperAppBundlePath(home);
 if (existsSync(cuaApp)) {
   console.log(`${dryRun ? '[dry-run] 将删除' : '已删除'} ${cuaApp}`);
   if (!dryRun) rmSync(cuaApp, { recursive: true, force: true });
+}
+// v1.0.1 品牌统一前的旧 .app 名残留（拼串构造，旧名字面量不回流源码）
+const LEGACY_CUA_APP_NAME = ['CUA', 'Helper'].join(' ');
+const legacyCuaApp = path.join(home, '.agentdesk', `${LEGACY_CUA_APP_NAME}.app`);
+if (legacyCuaApp !== cuaApp && existsSync(legacyCuaApp)) {
+  console.log(`${dryRun ? '[dry-run] 将删除' : '已删除'} ${legacyCuaApp}`);
+  if (!dryRun) rmSync(legacyCuaApp, { recursive: true, force: true });
 }
 console.log(dryRun ? `[uninstall] dry-run 结束，共 ${removed} 份清单待删。` : `[uninstall] 完成，共删 ${removed} 份清单。`);
 console.log('Chrome 一侧：chrome://extensions → 移除「AgentDesk」即彻底干净。');

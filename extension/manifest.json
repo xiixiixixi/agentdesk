@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "AgentDesk",
   "version": "1.0.0",
-  "description": "AgentDesk browser channel: lets the local AgentDesk service drive this browser's tabs (with your logged-in state) after you approve it. Screen channel is provided by the companion CUA Helper app.",
+  "description": "AgentDesk browser channel: lets the local AgentDesk service drive this browser's tabs (with your logged-in state) after you approve it. Screen channel is provided by the companion AgentDesk app.",
   "minimum_chrome_version": "116",
   "background": {
     "service_worker": "background.js"
@@ -29,7 +29,8 @@
       "32": "icons/icon32.png",
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
-    }
+    },
+    "default_popup": "popup.html"
   },
   "icons": {
     "16": "icons/icon16.png",

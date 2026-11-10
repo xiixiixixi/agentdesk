@@ -514,7 +514,7 @@ export function createCua(opts = {}) {
   let lastClick = null; // {x, y, atMs}：最近一次点击位置（type/key 的箭头提示用）
 
   /**
-   * v1.0.0：默认优先从 ~/.agentdesk/CUA Helper.app 启动 helper——TCC 权限挂在这个 .app 上
+   * v1.0.1：默认优先从 ~/.agentdesk/AgentDesk.app 启动 helper——TCC 权限挂在这个 .app 上
    * （终端是谁不再重要）；.app 不存在时退回仓库 host/cua-helper（裸 CLI，权限归终端）。
    * 每次取用都重新解析：setup/cua-selftest 中途装好 .app 后，下一个请求自动切过去。
    */
@@ -590,7 +590,7 @@ export function createCua(opts = {}) {
         ...(r.screen?.w && r.screen?.h ? { screen: { w: r.screen.w, h: r.screen.h } } : {}), // 主屏尺寸（自检定位叠加用）
         ...(typeof r.responsibleProcess === 'string' && r.responsibleProcess ? { responsibleProcess: r.responsibleProcess } : {}), // 设置里要勾选的宿主 App 名
         // v1.0.0：helper 从 .app 内运行 → 权限主体就是该 .app（引导切换为「拖 .app 授权」）
-        ...(r.helperBundle?.path ? { helperApp: { name: r.helperBundle.name ?? 'CUA Helper', path: r.helperBundle.path } } : {}),
+        ...(r.helperBundle?.path ? { helperApp: { name: r.helperBundle.name ?? 'AgentDesk', path: r.helperBundle.path } } : {}),
       };
     } catch (err) {
       return { axGranted: null, screenGranted: null, reason: err.message };

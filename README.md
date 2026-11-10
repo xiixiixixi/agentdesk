@@ -1,6 +1,6 @@
 # agentdesk
 
-一句话：让 AI 代理（agent）**双通道操控你的电脑**——通道一：**你真实的、带登录态的 Chromium 系浏览器**（标签/导航/截图/无障碍树/CDP）；通道二：**整块屏幕**（任何应用的窗口清单 / 界面元素 / 截图 / 点击输入）。通过「浏览器扩展 + 原生宿主 + 本地服务 + CUA Helper 独立 App」四件套桥接，以 MCP（Model Context Protocol）工具面暴露给任意 MCP 客户端（ZCode / Cursor 等）。
+一句话：让 AI 代理（agent）**双通道操控你的电脑**——通道一：**你真实的、带登录态的 Chromium 系浏览器**（标签/导航/截图/无障碍树/CDP）；通道二：**整块屏幕**（任何应用的窗口清单 / 界面元素 / 截图 / 点击输入）。通过「浏览器扩展 + 本地服务（直连 WebSocket）+ AgentDesk 独立 App」桥接，以 MCP（Model Context Protocol）工具面暴露给任意 MCP 客户端（ZCode / Cursor 等）。
 
 **纯本地架构**：所有指令只在你机器上的 127.0.0.1 里流动，不出网、无云端组件、无需账号。
 
@@ -16,27 +16,27 @@
 │        + connection.mjs（WS 服务端 / 租约镜像 / 心跳）
 │        │ WebSocket ws://127.0.0.1:<port>（JSON-RPC 2.0，见 docs/PROTOCOL.md）
 │        ▼
-├─ 2 ─ native host  host/host.mjs —— 哑中继（读 host-config.json，帧转发，无浏览器逻辑）
-│        │ Chrome Native Messaging（每帧一个 JSON）
-│        ▼
+├─ 2 ─ （可选）native host  host/host.mjs —— 旧方案哑中继；默认不用（--native-host 才装）
+│
 ├─ 1 ─ extension  extension/background.js（MV3）—— 租约权威 + chrome.debugger CDP 执行体
+│        │ 默认直连 ws://127.0.0.1:<port>（token + Origin 白名单校验，无需浏览器清单）
 │        ▼
 └─ 用户浏览器（Chrome/Edge/Brave/Opera/Vivaldi/Arc，真实 profile，登录态天然可用）
 
-屏幕通道（cua_*）：service/cua.mjs → ~/.agentdesk/CUA Helper.app（swift/cua-helper.swift
+屏幕通道（cua_*）：service/cua.mjs → ~/.agentdesk/AgentDesk.app（swift/cua-helper.swift
 编译的独立后台 App，macOS TCC 权限的持权主体）/ osascript B 层兜底
 ```
 
 - 命令目录、事件、错误码、CDP 白名单的单一事实来源：`shared/protocol.mjs`。
-- 连接方向：host 主动连 service（service 监听 127.0.0.1）；一个浏览器一个 host 进程；断连后租约镜像保留 60s 等重连。
+- 连接方向：扩展直连 service（service 监听 127.0.0.1；默认通道），旧 native 方案下由 host 主动连；断连后租约镜像保留 60s 等重连。
 
-## 快速开始（npm 安装，两条命令 + 一次拖拽）
+## 快速开始（npm 安装，两条命令 + 一次加载扩展）
 
 ```bash
 # 1. 全局安装（需要 Node 18+；全局路径固定 → 扩展 ID 稳定，升级不失效）
 npm install -g agentdesk
 
-# 2. 一条命令安装：自动算扩展ID → 检测已装浏览器 → 写清单/配置 → 装 CUA Helper.app
+# 2. 一条命令安装：自动算扩展ID → 写直连配置（token/端口，无需浏览器清单）→ 装 AgentDesk.app
 #    → 打开 Chrome 扩展页（目录路径自动进剪贴板）→ 原地等待验证
 agentdesk          # 即 setup
 ```
@@ -69,13 +69,13 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 > 源码安装的目录一旦移动就要重跑 setup 重新加载扩展。
 
 卸载：npm 安装用户 `agentdesk-uninstall` 后再 `npm uninstall -g agentdesk`；
-源码用户 `npm run uninstall`。两者都只删本机清单、配置与 CUA Helper.app，Chrome 内手动移除扩展即彻底干净。
+源码用户 `npm run uninstall`。两者都只删本机直连配置（token/端口）、旧版清单残留与 AgentDesk.app，Chrome 内手动移除扩展即彻底干净。
 
 高级参数：`agentdesk -- --no-open`（不自动开 Chrome）/ `--port N` / `--timeout 秒` /
 `--browser all|chrome|edge|brave|opera|vivaldi|arc` / `--dry-run`（源码用户等价命令 `npm run setup -- …`）。
 
 更新到新版：npm 安装用户 `npm update -g agentdesk`；源码用户 `git pull && npm install`。
-两者升级后扩展无需重新加载（ID 不变），但建议重跑一次 setup 刷新配置与 CUA Helper.app。
+两者升级后扩展无需重新加载（ID 不变），但建议重跑一次 setup 刷新配置与 AgentDesk.app。
 
 ## 服务生命周期（常问三问）
 
@@ -119,9 +119,9 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 设计原则：**分层注入**（元素级 AX 动作优先，坐标兜底）、**AX 优先**（先读无障碍树再谈坐标）、
 **物理验证**（动作留"前证据"，`cua_verify` 取"后证据"成对核对）、**能力探测**（逐级降级，如实报告）。
 
-### CUA Helper.app：权限挂在独立 App 上（v1.0.0）
+### AgentDesk.app：权限挂在独立 App 上（v1.0.0）
 
-`npm run setup` 会自动把 Swift 助手装成 `~/.agentdesk/CUA Helper.app`（`com.agentdesk.cua-helper`，
+`npm run setup` 会自动把 Swift 助手装成 `~/.agentdesk/AgentDesk.app`（`com.agentdesk.cua-helper`，
 后台 App、无 Dock 图标、琥珀色品牌图标）。macOS 的辅助功能/屏幕录制权限（TCC）挂在这个 .app 上——
 **终端是谁不再重要**：换终端、换 AI 客户端、服务重启都不影响授权；helper 也可独立重启以重读授权。
 
@@ -132,24 +132,24 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 
 - 系统设置打开到正确面板的同时，屏幕上浮一张 **560×124 琥珀引导卡片**，贴在设置窗口
   正下方并**跟随窗口移动**；
-- 卡片左侧的大图标就是拖拽句柄——**按住它拖出的就是 CUA Helper.app 本体**，直接放进
+- 卡片左侧的大图标就是拖拽句柄——**按住它拖出的就是 AgentDesk.app 本体**，直接放进
   上方的「辅助功能」「屏幕录制」列表即完成授权（等同点列表下方的 + 号再选 App，少四步）；
 - 放手后**自动检测**（轮询权限状态，绝不弹系统对话框打扰）：一生效卡片自动消失、
   helper 自动重启重读授权、终端里自动打钩，无需回车报到。
 
-手动开也在 **系统设置 → 隐私与安全性**：把「CUA Helper」加进/勾选「辅助功能」「屏幕录制」两项。
+手动开也在 **系统设置 → 隐私与安全性**：把「AgentDesk」加进/勾选「辅助功能」「屏幕录制」两项。
 
 ### 三层能力（逐级探测，优雅降级）
 
 | 层 | 条件 | 窗口清单 | 读元素 | 元素点击 | 坐标点击 | 输入/按键 | 截图 |
 |---|---|---|---|---|---|---|---|
-| **A**（最强） | CUA Helper.app / host/cua-helper 已编译 + 辅助功能已授权 | ✓ | ✓（快） | ✓（AX 动作，失败自动取元素中心兜底） | ✓（先置前后全局注入，如实回执） | ✓（可定向） | ✓ |
+| **A**（最强） | AgentDesk.app / host/cua-helper 已编译 + 辅助功能已授权 | ✓ | ✓（快） | ✓（AX 动作，失败自动取元素中心兜底） | ✓（先置前后全局注入，如实回执） | ✓（可定向） | ✓ |
 | **B**（零编译兜底） | 无 helper，但辅助功能已授权（osascript + System Events） | ✓ | ✓（较慢） | ✓ | ✗ | ✓（进前台应用） | ✓ |
 | **C**（无任何授权） | 辅助功能未授权 | helper 编译过时 ✓（窗口表本身无需授权） | ✗ | ✗ | ✗ | ✗ | ✓（需屏幕录制授权） |
 | **幽魂光标**（A 层附属能力） | helper 已编译 | 点击位置闪现琥珀色 AI 专属光标（叠加窗实现） | — | ✓（元素模式取目标窗口中心近似） | ✓（精确坐标） | ✓（30 秒内点击过则在原地提示箭头） | — |
 
 - A 层助手是随包分发的单文件 Swift 源码（`swift/cua-helper.swift`），`npm run setup` 自动用本机
-  swiftc 编译并装进 CUA Helper.app（编译产物不入库；无 swiftc 时静默落到 B 层，不算安装失败）。
+  swiftc 编译并装进 AgentDesk.app（编译产物不入库；无 swiftc 时静默落到 B 层，不算安装失败）。
 - **幽魂光标（v0.5.1）**：AI 每次点击会在目标位置短暂闪现琥珀色 AI 光标（与扩展角标同色系，
   点击带一圈扩散涟漪，约 0.7 秒后淡出），输入则原地提示箭头——让你看得见 AI 动手在哪。
   叠加窗实现：**点击穿透、不抢焦点、真鼠标不动、无新系统权限**；叠加失败绝不影响真实动作，
@@ -214,7 +214,8 @@ npm run credential -- remove https://github.com
 
 ## 已知限制
 
-- 支持 Chromium 系浏览器：Chrome / Edge / Brave / Opera / Vivaldi / Arc（Arc 的清单路径按 Chromium 规则实现并双写候选位置，已在无 Arc 的机器上通过安装测试；Windows 侧未实测）。Safari/Firefox 不适用。
+- 支持 Chromium 系浏览器：Chrome / Edge / Brave / Opera / Vivaldi / Arc（Windows 侧未实测）。Safari/Firefox 不适用。
+- **Arc 兼容性**：Arc 的标签分组接口实测会挂起（v1.0.1 已加 1.5s 超时兜底，未在 Arc 重载验证）；多浏览器同时装着扩展时建议只保留 Chrome 的开关打开。
 - 凭据仓**当前仅支持 macOS 钥匙串**（非 macOS 上 `ab_login`/`ab_credentials` 明确报不支持）；登录路上的**图形验证码、设备确认**（推送/短信二次确认）无法全自动，需要人工接手。
 - Windows 分支（注册表等）已实现但未在真实 Windows 上测试过。
 - 剪贴板写入返回「不支持，请用定位器输入」（诚实报错）；`downloads.open` 需 Chrome 可选权限；嵌套 iframe 内的元素定位暂不支持（`ab_login` 因此也只认主文档里的登录表单）。
@@ -226,8 +227,8 @@ npm run credential -- remove https://github.com
 npm test          # 140+ 个单元测试
 npm run selftest  # 全链路自检（真 WS + 伪扩展，无需浏览器）
 npm run cua-selftest  # 屏幕通道自检（只读探测 + 试拍，不做任何点击）
-npm run doctor    # 本机链路体检：扩展目录/通信清单/端口监听/CUA Helper 与授权，逐项给修复建议
-npm run e2e       # 端到端（需 Playwright 的 Chromium for Testing；自动装/清清单，不碰用户 Chrome；登录用例会短暂写入并清理本机钥匙串测试条目）
+npm run doctor    # 本机链路体检：扩展目录/直连配置/端口监听/AgentDesk 与授权，逐项给修复建议
+npm run e2e       # 端到端（需 Playwright 的 Chromium for Testing；自动临时直连配置并还原，不碰用户 Chrome；登录用例会短暂写入并清理本机钥匙串测试条目）
 npm run verify    # 一键真机验收：起服务等真实浏览器扩展连入（40s），11 项检查（标签/导航/截图/批量阅读/WebMCP/审计/CUA/幽魂试闪）输出记分卡；只动自建标签页
 npm run check     # 全部语法检查
 ```

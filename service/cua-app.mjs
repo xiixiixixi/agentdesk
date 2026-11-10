@@ -1,4 +1,4 @@
-// service/cua-app.mjs — CUA Helper.app：屏幕操作助手的独立 .app 安装（v1.0.0）
+// service/cua-app.mjs — AgentDesk.app：屏幕操作助手的独立 .app 安装（v1.0.1 品牌统一）
 //
 // 为什么要有这个 .app（照成熟桌面操控产品的通行做法）：
 //   macOS 的 TCC 权限（辅助功能/屏幕录制）按「持权 App」记账。CLI 二进制直接跑时，
@@ -8,7 +8,7 @@
 //   重读 TCC grant 而无需重启整个服务。
 //
 // 安装形态（setup / cua-selftest 自动创建，勿手改）：
-//   ~/.agentdesk/CUA Helper.app/
+//   ~/.agentdesk/AgentDesk.app/
 //   └── Contents/
 //       ├── Info.plist        CFBundleIdentifier=com.agentdesk.cua-helper；LSUIElement=true（无 Dock 图标）
 //       │                     NSAppleEventsUsageDescription="AgentDesk screen control"
@@ -18,7 +18,7 @@
 // 本模块为纯逻辑 + 可注入 home/iconSrc 的安装函数（测试用临时目录覆盖，见 test/cua.test.mjs）。
 
 import { spawnSync } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
@@ -27,9 +27,12 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 export const CUA_APP_BUNDLE_ID = 'com.agentdesk.cua-helper';
-export const CUA_APP_NAME = 'CUA Helper';
+export const CUA_APP_NAME = 'AgentDesk';
 export const AGENTDESK_HOME_DIRNAME = '.agentdesk';
-export const CUA_HELPER_VERSION = '1.0.0';
+export const CUA_HELPER_VERSION = '1.0.1';
+
+// v1.0.1 品牌统一：旧版 .app 名（安装时清理，避免用户设置里出现两个授权主体）。
+export const CUA_APP_LEGACY_NAMES = ['CUA Helper'];
 
 /** 仓库内品牌图标（随包分发；缺它也能装，只是 Finder 里没图标）。 */
 export const CUA_APP_ICON_SRC = path.join(ROOT, 'assets', 'AppIcon.icns');
@@ -37,10 +40,10 @@ export const CUA_APP_ICON_SRC = path.join(ROOT, 'assets', 'AppIcon.icns');
 /** ~/.agentdesk（可注入 home 供测试）。 */
 export function agentdeskHome(home = os.homedir()) { return path.join(home, AGENTDESK_HOME_DIRNAME); }
 
-/** ~/.agentdesk/CUA Helper.app */
+/** ~/.agentdesk/AgentDesk.app */
 export function cuaHelperAppBundlePath(home = os.homedir()) { return path.join(agentdeskHome(home), `${CUA_APP_NAME}.app`); }
 
-/** ~/.agentdesk/CUA Helper.app/Contents/MacOS/cua-helper —— cua.mjs 默认优先启动的二进制。 */
+/** ~/.agentdesk/AgentDesk.app/Contents/MacOS/cua-helper —— cua.mjs 默认优先启动的二进制。 */
 export function cuaHelperAppBinaryPath(home = os.homedir()) {
   return path.join(cuaHelperAppBundlePath(home), 'Contents', 'MacOS', 'cua-helper');
 }
@@ -95,7 +98,7 @@ function isUpToDate(stampPath, wantStamp, binaryPath) {
 }
 
 /**
- * 创建/刷新 CUA Helper.app（幂等：内容未变不重写，避免 TCC 对二进制的无谓失效）。
+ * 创建/刷新 AgentDesk.app（幂等：内容未变不重写，避免 TCC 对二进制的无谓失效）。
  * @param {{srcBinary?: string, home?: string, iconSrc?: string, version?: string,
  *          codesign?: boolean, log?: Function}} [opts]
  *   srcBinary —— helper 二进制（默认仓库 host/cua-helper）
@@ -108,7 +111,7 @@ export function ensureCuaHelperApp({ srcBinary, home = os.homedir(), iconSrc = C
   const binaryPath = cuaHelperAppBinaryPath(home);
   const src = srcBinary ?? path.join(ROOT, 'host', 'cua-helper');
   if (process.platform !== 'darwin') {
-    return { installed: false, appPath, binaryPath, reason: 'CUA Helper.app 仅支持 macOS', iconInstalled: false, copiedBinary: false, signed: 'skipped' };
+    return { installed: false, appPath, binaryPath, reason: 'AgentDesk.app 仅支持 macOS', iconInstalled: false, copiedBinary: false, signed: 'skipped' };
   }
   if (!existsSync(src)) {
     return { installed: false, appPath, binaryPath, reason: `helper 二进制不存在: ${src}（先编译 swift/cua-helper.swift）`, iconInstalled: false, copiedBinary: false, signed: 'skipped' };
@@ -158,6 +161,14 @@ export function ensureCuaHelperApp({ srcBinary, home = os.homedir(), iconSrc = C
         signed = true; // 已有有效签名（内容未变）
       }
     } catch { signed = 'skipped'; }
+  }
+
+  // v1.0.1 品牌统一：旧版「CUA Helper.app」→「AgentDesk.app」；装好新 bundle 后清掉旧 bundle
+  // （TCC 里的旧条目由系统保留，用户可在设置里手动移除以彻底干净）。
+  for (const legacy of CUA_APP_LEGACY_NAMES) {
+    const legacyPath = path.join(agentdeskHome(home), `${legacy}.app`);
+    if (legacyPath === appPath || !existsSync(legacyPath)) continue;
+    try { rmSync(legacyPath, { recursive: true, force: true }); log(`   已移除旧版 ${legacy}.app（品牌统一为 AgentDesk）`); } catch { /* 清理失败不影响新装 */ }
   }
 
   return { installed: true, appPath, binaryPath, iconInstalled, copiedBinary, signed };

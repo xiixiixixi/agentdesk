@@ -23,8 +23,26 @@
 //   白名单留痕副作用命令；frontend 代理的命令同样经 BrowserConnection.cmd，天然覆盖。
 
 import { EventEmitter } from 'node:events';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { EV, ERR, COMMANDS, PROTOCOL_VERSION, FRONTEND_HELLO, FRONTEND_CMD } from '../shared/protocol.mjs';
+
+// v1.0.1 直连模式：setup 写 extension/runtime-config.json；service 用同一份配置校验
+// 直连扩展的 Origin（chrome-extension://<id> 白名单）与 token（?token=）。
+// 文件不存在（旧安装/测试）时保持旧行为：接受 host/native 连接，网页 Origin 一律拒绝。
+const RUNTIME_CONFIG_PATH = process.env.AGENTDESK_RUNTIME_CONFIG
+  ? path.resolve(process.env.AGENTDESK_RUNTIME_CONFIG)
+  : path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'extension', 'runtime-config.json');
+
+function loadRuntimeConfig() {
+  try {
+    const cfg = JSON.parse(readFileSync(RUNTIME_CONFIG_PATH, 'utf8'));
+    if (!cfg || cfg.mode !== 'ws' || !Array.isArray(cfg.extensionIds) || typeof cfg.token !== 'string' || !cfg.token) return null;
+    return cfg;
+  } catch { return null; }
+}
 
 // v1 前端协议约定：无浏览器连接时的 mcp/cmd 错误码（数值上与 ERR.TAB_NOT_FOUND 相同）。
 const FRONTEND_NO_BROWSER_CODE = -32002;
@@ -57,6 +75,10 @@ export class BrowserConnection extends EventEmitter {
     this.userAgent = null;
     this.profileName = null;
     this.capabilities = [];
+    // v1.0.1 受控权（多浏览器互斥）：扩展在 ext/hello.control 里报 {enabled, claimTs, label}
+    this.controlEnabled = true;
+    this.controlClaimTs = 0;
+    this.label = null;
     this.registeredAt = null;
     this.restored = false; // 重连恢复（同 instanceId）
     this.leases = new Map(); // tabId -> lease（镜像，权威在扩展）
@@ -166,6 +188,10 @@ export class BrowserConnection extends EventEmitter {
     this.userAgent = p.userAgent ?? null;
     this.profileName = p.profileName ?? null;
     this.capabilities = Array.isArray(p.capabilities) ? p.capabilities : [];
+    const ctl = (p.control && typeof p.control === 'object') ? p.control : null;
+    this.controlEnabled = ctl ? ctl.enabled !== false : true;
+    this.controlClaimTs = ctl ? (Number(ctl.claimTs) || 0) : 0;
+    this.label = (ctl && ctl.label) ? String(ctl.label) : ((p.family || 'browser') + ' ' + (p.browserVersion || '')).trim();
     this.registeredAt = Date.now();
     this.restored = false;
     const retained = this.manager.retained.get(this.instanceId);
@@ -292,6 +318,8 @@ export class ConnectionManager extends EventEmitter {
     this.connections = new Set();
     this.retained = new Map(); // instanceId -> {leases, closedAt, purgeTimer}
     this.frontendSockets = new Set(); // FrontendConnection 集合（多实例前端）
+    this.activeInstanceId = null; // v1.0.1 互斥：当前唯一的受控浏览器实例
+    this.activeLabel = null;
     this._nextConnId = 1;
   }
 
@@ -299,12 +327,13 @@ export class ConnectionManager extends EventEmitter {
   get protocolVersion() { return PROTOCOL_VERSION; }
 
   async start() {
+    this.runtimeConfig = loadRuntimeConfig();
     await new Promise((resolve, reject) => {
       this.wss = new WebSocketServer({ host: this.opts.host, port: this.opts.port }, resolve);
       this.wss.once('error', reject);
       this.wss.on('error', () => { /* 运行期错误由 close 兜底（含 EADDRINUSE 被拒后） */ });
     });
-    this.wss.on('connection', (socket) => this._onConnection(socket));
+    this.wss.on('connection', (socket, req) => this._onConnection(socket, req));
     return this;
   }
 
@@ -313,7 +342,24 @@ export class ConnectionManager extends EventEmitter {
    *   mcp/hello（带 id）→ frontend（共用本服务的另一个 mcp-entry）；
    *   其余（host/hello 等）→ 浏览器 host 连接，首帧回放给 BrowserConnection。
    */
-  _onConnection(socket) {
+  _onConnection(socket, req) {
+    // ---- 直连模式安全边界（v1.0.1）----
+    // 网页（http/https Origin）绝不允许冒充浏览器连接：直接关闭。
+    // 扩展页（chrome-extension:// Origin）必须命中 runtime-config 的 extensionIds 白名单 + token。
+    const origin = String((req && req.headers && req.headers.origin) || '');
+    if (/^https?:\/\//i.test(origin)) {
+      try { socket.close(1008, 'web origin not allowed'); } catch { /* 已关 */ }
+      return;
+    }
+    if (origin.startsWith('chrome-extension://')) {
+      const cfg = this.runtimeConfig;
+      const extId = origin.slice('chrome-extension://'.length).replace(/\/$/, '');
+      let token = '';
+      try { token = new URL(req.url || '/', 'ws://127.0.0.1').searchParams.get('token') || ''; } catch { /* 坏 URL → 空 token */ }
+      if (!cfg) { try { socket.close(1008, 'runtime config missing (run setup)'); } catch { /* 已关 */ } return; }
+      if (!cfg.extensionIds.includes(extId)) { try { socket.close(1008, 'extension id not allowed'); } catch { /* 已关 */ } return; }
+      if (token !== cfg.token) { try { socket.close(1008, 'bad token'); } catch { /* 已关 */ } return; }
+    }
     const onFirst = (data) => {
       detach();
       let msg = null;
@@ -332,19 +378,47 @@ export class ConnectionManager extends EventEmitter {
     socket.on('close', onClose);
   }
 
-  /** 已注册（ext/hello 完成）且未断开的连接。 */
-  liveConnections() {
+  /** 已注册（ext/hello 完成）且未断开的连接（原始集合，不做排序）。 */
+  _rawLive() {
     return [...this.connections].filter((c) => c.instanceId && !c.isClosed);
+  }
+
+  /** 已注册且未断开的连接：**受控实例排第一**（默认浏览器 = 受控的那个，互斥）。 */
+  liveConnections() {
+    const raw = this._rawLive();
+    return raw.sort((a, b) => {
+      const aActive = a.instanceId === this.activeInstanceId ? 1 : 0;
+      const bActive = b.instanceId === this.activeInstanceId ? 1 : 0;
+      if (aActive !== bActive) return bActive - aActive;
+      return (b.registeredAt || 0) - (a.registeredAt || 0);
+    });
+  }
+
+  /** 重新选举受控浏览器并广播给所有连接（claimTs 最大者胜；无启用者则无人受控）。 */
+  _electActive() {
+    const eligible = this._rawLive().filter((c) => c.controlEnabled);
+    eligible.sort((a, b) => (b.controlClaimTs - a.controlClaimTs) || ((b.registeredAt || 0) - (a.registeredAt || 0)));
+    const prev = this.activeInstanceId;
+    this.activeInstanceId = eligible.length ? eligible[0].instanceId : null;
+    this.activeLabel = eligible.length ? eligible[0].label : null;
+    for (const c of this._rawLive()) {
+      c._send({ jsonrpc: '2.0', method: EV.CONTROL_STATE, params: { activeInstanceId: this.activeInstanceId, activeLabel: this.activeLabel } });
+    }
+    if (prev !== this.activeInstanceId) this.emit('controlChange', { activeInstanceId: this.activeInstanceId, activeLabel: this.activeLabel });
   }
 
   get(instanceId) {
     return this.liveConnections().find((c) => c.instanceId === instanceId) ?? null;
   }
 
-  _onRegistered(conn) { this.emit('browser', conn); }
+  _onRegistered(conn) {
+    this._electActive(); // 新连接/重发 hello（claim 变化）都重新选举并广播
+    this.emit('browser', conn);
+  }
 
   _onClosed(conn) {
     this.connections.delete(conn);
+    this._electActive(); // 受控浏览器断开 → 立刻把受控权交给还在线的另一个
     if (!conn.instanceId) return;
     this.emit('browserClosed', conn);
     const purgeTimer = setTimeout(() => this.retained.delete(conn.instanceId), this.opts.leaseMirrorTtlMs);
