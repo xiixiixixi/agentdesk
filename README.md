@@ -47,8 +47,21 @@ MCP 配置（无需路径，命令已进 PATH）：
 { "mcpServers": { "agentdesk": { "command": "agentdesk-mcp" } } }
 ```
 
+### 各客户端接入示例（已装 agentdesk-mcp 的前提下）
+
+| 客户端 | 配置位置 | 写法 |
+|---|---|---|
+| DeepSeek Harness | `~/.dsh/cordis.patch.yml` | 见下方 MCP 客户端定义（`serverName: agentdesk` + `command: agentdesk-mcp`） |
+| Codex | `~/.codex/config.toml` | `[mcp_servers.agentdesk]` → `command = "agentdesk-mcp"` |
+| Claude Code | `~/.claude.json` 的 `mcpServers` | `{"type":"stdio","command":"agentdesk-mcp"}` |
+| Cursor | `~/.cursor/mcp.json` 的 `mcpServers` | 同上 |
+| 其他 MCP 客户端 | 任意 | stdio：`agentdesk-mcp` |
+
 其他命令：`agentdesk-doctor`（体检）、`agentdesk-uninstall`（卸载）、
 `agentdesk -- --no-open/--port/--browser arc` 等参数照旧。
+
+> **Chrome 商店上架是可选的**：商店只是一键安装渠道，需要一次性 $5 开发者账号；暂未上架不影响使用——
+> 按下面的“开发者模式加载扩展”方式安装即可，功能完全一致。
 
 <details><summary>从 GitHub 源码安装（替代方式）</summary>
 
@@ -64,6 +77,9 @@ MCP 配置指向 `node /绝对路径/agentdesk/service/mcp-entry.mjs`。
 setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开发者模式 →
 「加载已解压的扩展程序」→ 粘贴剪贴板里的目录路径。验证打钩后，setup 直接给出
 可复制的 MCP 客户端配置片段（端口已自动固化，无需传参）。
+
+**没有 Chrome 商店也要怎么给别人装？** 把上面的 `npm install -g @xiixiixixi/agentdesk` + `agentdesk` + 一次
+“加载已解压的扩展程序” 三步发给对方即可（扩展目录路径会由 setup 自动复制到剪贴板）。
 
 > 扩展 ID 由扩展目录的绝对路径决定（Chrome 的规则）。**npm 全局安装的路径固定 → 升级版本 ID 不变**；
 > 源码安装的目录一旦移动就要重跑 setup 重新加载扩展。
