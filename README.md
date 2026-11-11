@@ -30,15 +30,16 @@
 - 命令目录、事件、错误码、CDP 白名单的单一事实来源：`shared/protocol.mjs`。
 - 连接方向：扩展直连 service（service 监听 127.0.0.1；默认通道），旧 native 方案下由 host 主动连；断连后租约镜像保留 60s 等重连。
 
-## 快速开始（npm 安装，两条命令 + 一次加载扩展）
+## 快速开始（npm 一条命令 + 一次加载扩展）
 
 ```bash
 # 1. 全局安装（需要 Node 18+；全局路径固定 → 扩展 ID 稳定，升级不失效）
 npm install -g @xiixiixixi/agentdesk
 
-# 2. 一条命令安装：自动算扩展ID → 写直连配置（token/端口，无需浏览器清单）→ 装 AgentDesk.app
-#    → 打开 Chrome 扩展页（目录路径自动进剪贴板）→ 原地等待验证
-agentdesk          # 即 setup
+# 2. 一条命令全部搞定：算扩展ID → 写直连配置 → 装 AgentDesk.app
+#    → 自动写 Codex / Claude Code / Claude Desktop / Cursor / DSH 的 MCP 配置
+#    → 打开 Chrome 扩展页（目录路径自动进剪贴板）→ 原地等待扩展回连验证
+agentdesk          # 即 setup；--no-mcp-config 可跳过自动写客户端配置
 ```
 
 MCP 配置（无需路径，命令已进 PATH）：
@@ -62,6 +63,10 @@ MCP 配置（无需路径，命令已进 PATH）：
 
 > **Chrome 商店上架是可选的**：商店只是一键安装渠道，需要一次性 $5 开发者账号；暂未上架不影响使用——
 > 按下面的“开发者模式加载扩展”方式安装即可，功能完全一致。
+
+> **一条命令覆盖了什么**：装助手 App、写直连配置（token/端口）、写本机已安装 AI 客户端的 MCP 配置、
+> 打开扩展页并复制目录路径、等待扩展回连验证。**唯一剩下的手动步骤就是 Chrome 里点一次
+> “加载已解压的扩展程序”**（Chrome 不允许程序静默安装扩展，商店上架后才可能省掉）。
 
 <details><summary>从 GitHub 源码安装（替代方式）</summary>
 

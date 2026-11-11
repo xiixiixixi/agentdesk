@@ -27,6 +27,7 @@ import { ConnectionManager } from './service/connection.mjs';
 import { compileHelper, createCua } from './service/cua.mjs';
 import { ensureCuaHelperApp } from './service/cua-app.mjs';
 import { missingPermissions, showGuideCards } from './service/cua-guide.mjs';
+import { applyMcpConfigs } from './installer/mcp-config.mjs';
 
 // setup.mjs 位于仓库根，REPO_ROOT 就是它所在目录（此前误用 '..' 多退一级）
 const REPO_ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -36,18 +37,19 @@ const log = (s) => console.log(s);
 const isMac = process.platform === 'darwin';
 
 function parseArgs(argv) {
-  const out = { dryRun: false, port: null, timeoutSec: 240, browser: null, home: null, noOpen: false, nativeHost: false };
+  const out = { dryRun: false, port: null, timeoutSec: 240, browser: null, home: null, noOpen: false, nativeHost: false, noMcpConfig: false };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     const next = () => { const v = argv[++i]; if (v === undefined) throw new Error(`missing value for ${a}`); return v; };
     if (a === '--dry-run') out.dryRun = true;
     else if (a === '--no-open') out.noOpen = true;
     else if (a === '--native-host') out.nativeHost = true; // 兼容旧方案：写浏览器 native messaging 清单
+    else if (a === '--no-mcp-config') out.noMcpConfig = true; // 不自动写 Codex/Claude/Cursor/DSH 的 MCP 配置
     else if (a === '--port') out.port = Number(next());
     else if (a === '--timeout') out.timeoutSec = Number(next());
     else if (a === '--browser') out.browser = next();
     else if (a === '--home') out.home = path.resolve(next());
-    else if (a === '--help' || a === '-h') { log('usage: node setup.mjs [--dry-run] [--port N] [--timeout 秒] [--browser all|chrome|…|vivaldi] [--home DIR] [--native-host]'); process.exit(0); }
+    else if (a === '--help' || a === '-h') { log('usage: node setup.mjs [--dry-run] [--port N] [--timeout 秒] [--browser all|chrome|…|vivaldi] [--home DIR] [--native-host] [--no-mcp-config]'); process.exit(0); }
     else throw new Error(`unknown argument: ${a}`);
   }
   return out;
@@ -130,6 +132,12 @@ async function main() {
     if (args.dryRun) {
       log(`③ [dry-run] 将写入直连配置：${runtimeConfigPath}（端口 ${port}、扩展 ID ${extId}、token 已生成）`);
       log(`   [dry-run] 将清理旧 native 清单 ${cleaned.length} 份、写 ${hostConfigPath}`);
+      const mcpEntry0 = path.join(REPO_ROOT, 'service', 'mcp-entry.mjs');
+      const npxMode0 = REPO_ROOT.includes(`${path.sep}_npx${path.sep}`);
+      if (!args.noMcpConfig) {
+        const dry = applyMcpConfigs({ home: homeDir, nodePath: process.execPath, entryPath: mcpEntry0, npx: npxMode0, dryRun: true });
+        log('   [dry-run] MCP 客户端：' + (dry.length ? dry.map((r) => `${r.label}:${r.status}`).join('，') : '未检测到已安装客户端'));
+      }
       log('dry-run 结束（未落盘、未启动验证）。');
       return 0;
     }
@@ -173,10 +181,24 @@ async function main() {
     await manager.stop().catch(() => {});
   }
 
-  // 7. MCP 配置片段（端口已固化进 host-config，客户端命令无需带 --port）
+  // 7. 自动写入 MCP 客户端配置（v1.0.3）：检测到谁就写谁；已存在则跳过；--no-mcp-config 可关
   const entry = path.join(REPO_ROOT, 'service', 'mcp-entry.mjs');
+  const npxMode = REPO_ROOT.includes(`${path.sep}_npx${path.sep}`);
+  if (!args.noMcpConfig) {
+    log('');
+    log('⑥ 自动接入 MCP 客户端（检测到才写，写前备份，已存在跳过）…');
+    const mcpResults = applyMcpConfigs({ home: homeDir, nodePath: process.execPath, entryPath: entry, npx: npxMode, dryRun: false });
+    if (!mcpResults.length) {
+      log('   - 未检测到已安装的 MCP 客户端（Codex / Claude Code / Claude Desktop / Cursor / DSH）');
+    }
+    for (const r of mcpResults) {
+      const label = r.status === 'written' ? '✓ 已写入' : r.status === 'exists' ? '✓ 已存在（跳过）'
+        : r.status === 'skip' ? '- 跳过' : r.status === 'error' ? '✗ 失败' : r.status;
+      log(`   ${label}：${r.label}${r.reason ? '（' + r.reason + '）' : ''}`);
+    }
+  }
   log('');
-  log('⑥ 给 MCP 客户端的配置（复制即用）：');
+  log('⑦ 给 MCP 客户端的配置（上面没检测到的客户端，复制即用）：');
   log('npm 安装用户（推荐）：');
   log(JSON.stringify({ mcpServers: { agentdesk: { command: 'agentdesk-mcp' } } }));
   log('源码（git clone）用户：');
@@ -184,7 +206,7 @@ async function main() {
 
   // 8. 屏幕操作（CUA）助手：可选增强，编译失败不算安装失败（B 层 osascript 兜底）
   log('');
-  log('⑦ 屏幕操作助手（cua_* 工具，可选增强）：');
+  log('⑧ 屏幕操作助手（cua_* 工具，可选增强）：');
   const cua = compileHelper({ log: (m) => log(`   ${m}`) });
   if (cua.compiled) {
     log('   ✓ 已编译 host/cua-helper（A 层：窗口清单 / AX 元素操作 / 定向坐标点击）');
