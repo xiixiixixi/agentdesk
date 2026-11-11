@@ -81,6 +81,8 @@ export function buildCuaHelperInfoPlist({ version = CUA_HELPER_VERSION } = {}) {
 	<true/>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>AgentDesk screen control</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>AgentDesk live window preview</string>
 </dict>
 </plist>
 `;

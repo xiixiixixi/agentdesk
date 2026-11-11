@@ -150,8 +150,8 @@ ChatGPT Desktop（Electron，app.asar 742MB）── codex app-server（Rust，C
 - 多 MCP server：Computer Use / Messages / Calendar / Computer History / Event Stream 五个，加 Record&Replay（类名 + 审批文案可见）。
 
 **agentdesk**（证据：`service/cua.mjs`、`swift/cua-helper.swift`、`service/mcp.mjs`）：
-- 9 个细粒度工具：`cua_status/windows/ax_tree/screenshot/click/type/key/app_focus/verify`。
-- 无持久 REPL 状态；无 setValue/selectText/paste；无音频；只 macOS；浏览器与屏幕两套工具分离。
+- 15 个细粒度工具：`cua_status/windows/ax_tree/screenshot/click/set_value/action/select_text/paste/scroll/drag/type/key/app_focus/verify`。
+- 无持久 REPL 状态；无音频；只 macOS；浏览器与屏幕两套工具分离。
 
 **判定**：**Codex 强**（动作面/编排效率/跨平台/多服务）；agentdesk 的可发现性与单步可策略性更强。
 
@@ -167,6 +167,7 @@ ChatGPT Desktop（Electron，app.asar 742MB）── codex app-server（Rust，C
 
 **agentdesk**（代码事实）：
 - CUA Helper.app 编译安装 + TCC 引导卡片（560×124 拖拽、自动轮询检测、自动开面板）；A/B/C 三层降级 + capabilities + guidance；`cua_verify` 前后截图证据对；幽魂光标（点击穿透、不抢焦点、不动真鼠标）；窗口级 `windowId` 精确定位。
+- **v1.1.0 起补齐 Codex 的焦点模型**：坐标点击先投递 AppKitDefined/ApplicationActivated 让目标应用“以为”自己在前台，再用 `NSEvent.mouseEvent(windowNumber:)` 造带窗口归属的事件、`postToPid` 定向投递——真实前台与真实光标都不动；5 秒无动作自动反激活，`app-focus`/退出时也会收尾。v1.1.2/1.1.3 补 select_text/paste/scroll/drag、AX 滚动条、键盘真激活后恢复、ScreenCaptureKit 实时 PiP 控制指示器。
 - **明确永不做**锁屏/解锁/绕过认证；无 per-app 策略；无远程投递；eval 无进程隔离。
 
 **判定**：**Codex 大幅强**（权限纵深/锁屏/远程/系统集成）；**agentdesk 在“不越锁屏红线 + 不移动真实光标 + 前后证据”上更保守、更可解释**。
@@ -248,7 +249,7 @@ ChatGPT Desktop（Electron，app.asar 742MB）── codex app-server（Rust，C
 1. **凭据仓**：钥匙串 + 双锁 + 本地 TOTP，凭据零进模型/日志/审计（Codex 无对应物）— `service/login.mjs`、`service/credentials.mjs`、`service/totp.mjs`。
 2. **动作级本地审计**：JSONL + 脱敏 + `ab_audit` 可查（Codex 遥测不可本地查）— `service/audit.mjs`、`service/mcp.mjs`。
 3. **`cua_verify` 前后证据对**：防“声称点了其实没点” — `service/cua.mjs`。
-4. **幽魂光标**：叠加窗点击穿透、不抢焦点、不移动真实光标、可 `cuaOverlay:false` 关、不入审计 — `swift/cua-helper.swift`。
+4. **幽魂光标 + 合成激活定向点击**：叠加窗点击穿透、不抢焦点；v1.1.0 起坐标点击也不再移动真实光标/抢真实前台（目标应用被合成激活，事件带窗口归属定向投递）；可 `cuaOverlay:false` 关、不入审计 — `swift/cua-helper.swift`。
 5. **A/B/C 显式降级 + capabilities + guidance**：Codex 无“能力层级”概念 — `service/cua.mjs`。
 6. **纯本地/零云/无账号**；控制面 loopback。
 7. **批量隐形读页** `ab_read_urls` + **实时投屏** `ab_screencast`（Codex `Tabs.content` 在 4 后端默认禁用，无投屏工具）。

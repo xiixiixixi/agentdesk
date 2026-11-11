@@ -24,19 +24,35 @@
 //                                        AX 未授权 → {ok:false, code:"not-granted"}（结构化，不崩溃）。
 //   element-click {pid, role, title?}  → 先 AXUIElement PerformAction(press)；失败兜底取元素 bounds
 //                                        中心做坐标点击 → {pressed} | {xyFallback, bounds, at}
-//   xy-click {x, y, pid?}              → v0.5.5：进程定向鼠标注入（CGEventPostToPid）在新系统已全面失效
-//                                        （窗口服务器按真实光标 hit-testing，Chromium 系与原生应用实测均忽略）。
-//                                        有 pid：点击点最上层不是目标窗口（不前台/被遮挡）先 AXRaise+activate
-//                                        把目标置前（遮挡者记 coveredBy），再全局注入并回 fallback:"global"
-//                                        （会移动真实光标，但保证生效）；无 pid：全局注入。
+//   set-value {pid, role, title?, value} → AXUIElementSetAttributeValue(kAXValue)，回读校验；
+//                                        不可写 → value-not-settable（不移动鼠标/不抢焦点）
+//   perform-action {pid, role, title?, action} → AXUIElementPerformAction；校验动作在 AXActionNames 中，
+//                                        大小写不敏感匹配；不支持 → action-not-available + 可用动作列表
+//   select-text {pid, role, title?, text, prefix?, suffix?, selection?} → 在 AXValue 文本里定位并设置
+//                                        AXSelectedTextRange（text/cursor_before/cursor_after），回读校验
+//   paste {pid, text, format?}         → 写入剪贴板（text/md/html）+ 定向 ⌘V，完成后恢复原剪贴板
+//   scroll {pid, x?, y?, role?, title?, direction?, pages?, scrollX?, scrollY?} → 定向滚轮事件
+//   drag {pid, fromX, fromY, toX, toY, steps?, durationMs?} → 定向按下/拖动/释放
+//   PiP-lite（常驻控制指示器）          → 动作期间在目标窗口右上角显示「AgentDesk 正在操作」+ 实时缩略图；
+//                                        非激活面板、点击穿透，合成激活结束/5s 无动作自动收起
+//   xy-click {x, y, pid?}              → v1.1.0：有 pid 且能定位目标窗口时走「合成激活 + 定向投递」：
+//                                        先向 pid 投递 AppKitDefined/ApplicationActivated（目标“以为”自己是
+//                                        前台，真实前台不变），再用 NSEvent.mouseEvent(windowNumber: 目标窗口)
+//                                        造 down/up、取 cgEvent、补窗口关联字段后 postToPid——事件落到目标
+//                                        窗口，真实光标不动、不抢前台。同一应用内非 key 窗口会先 AX 设为
+//                                        应用内 main（只动应用内部窗口序）。无 pid → 全局注入（会移动真实
+//                                        光标，回 fallback:"global"）；给 pid 但点击点无目标窗口 → 报错不盲点。
 //   type {pid?, text}                  → 键盘事件逐段输入：CGEventKeyboardSetUnicodeString 直塞 UTF-16 文本
 //                                        （中文等无键码字符的唯一可靠路径），按 UTF-16 码元分段（≤20/事件，
-//                                        规避单事件长度上限——一个 emoji 常占多个码元，按字符合段会超限）
+//                                        规避单事件长度上限——一个 emoji 常占多个码元，按字符合段会超限）。
+//                                        给 pid 时先确保目标“以为”自己是前台（合成激活），否则 keyWindow
+//                                        可能为空、输入无处可去。
 //   key {pid?, key, modifiers?}        → modifiers: cmd/ctrl/alt/shift；key 用键码映射表。v0.5.5 起修饰键按
 //                                        真实按键序列注入：flagsChange(按下修饰键) → keyDown(带 flag) → keyUp
 //                                        → flagsChange(释放)，事件间 5ms 间隔，配合 hidSystemState 事件源，
-//                                        ⌘S/⌘N 等组合键才能稳定触发系统对话框
-//   app-focus {pid}                    → AX raise 主窗口 + NSRunningApplication activate
+//                                        ⌘S/⌘N 等组合键才能稳定触发系统对话框。给 pid 时同样先合成激活。
+//   app-focus {pid}                    → 先撤销合成激活，再 AX raise 主窗口 + NSRunningApplication activate
+//   release-focus                      → 立即撤销合成激活（幂等）；最后一次动作后 5s 也会自动撤销
 //   overlay-show {x, y, kind:'arrow'|'click', durationMs?(默认700)} → {ok:true}
 //                                       幽魂光标：在 (x,y) 闪现琥珀色 AI 专属箭头（kind=click
 //                                       追加约 350ms 扩散涟漪），durationMs 后淡出。叠加窗点击
@@ -76,7 +92,12 @@
 // （nonactivating panel）：它就是引导用户完成系统授权的 UI，不碰任何其他应用。
 
 import Cocoa
+import CoreImage
+import CoreMedia
+import CoreVideo
+import Darwin
 import Foundation
+import ScreenCaptureKit
 
 // ---------- 响应输出（唯一 stdout 出口） ----------
 
@@ -299,6 +320,38 @@ func cmdAxTree(_ id: Any?, _ p: [String: Any]) {
     respondOk(id, ["nodes": nodes, "truncated": budget <= 0])
 }
 
+/** 只读诊断：返回屏幕坐标下的 AX 元素与可用动作（滚动/点击排障用）。 */
+func cmdAxHit(_ id: Any?, _ p: [String: Any]) {
+    guard axTrusted() else { respondErr(id, AX_NOT_GRANTED_HINT, code: "not-granted"); return }
+    guard let x = (p["x"] as? NSNumber)?.doubleValue, let y = (p["y"] as? NSNumber)?.doubleValue else {
+        respondErr(id, "ax-hit 需要 x/y", code: "bad-args")
+        return
+    }
+    let sys = AXUIElementCreateSystemWide()
+    var ref: AXUIElement?
+    let err = AXUIElementCopyElementAtPosition(sys, Float(x), Float(y), &ref)
+    guard err == .success, let el = ref else {
+        respondErr(id, "该点没有 AX 元素（AXError \(err.rawValue)）", code: "no-element")
+        return
+    }
+    var chain: [[String: Any]] = []
+    var cur = el
+    for _ in 0..<8 {
+        var namesRef: CFArray?
+        let actions = (AXUIElementCopyActionNames(cur, &namesRef) == .success ? (namesRef as? [String]) : nil) ?? []
+        chain.append([
+            "role": axAttr(cur, kAXRoleAttribute) as? String ?? "",
+            "title": axAttr(cur, kAXTitleAttribute) as? String ?? "",
+            "actions": actions,
+        ])
+        var parentRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(cur, kAXParentAttribute as CFString, &parentRef) == .success,
+              let p = parentRef else { break }
+        cur = unsafeBitCast(p, to: AXUIElement.self)
+    }
+    respondOk(id, ["chain": chain])
+}
+
 // ---------- element-click（AX press 优先，元素 bounds 中心坐标兜底） ----------
 
 /// 深度优先找 role（精确）+ title（给 title 时精确，否则第一个同 role）匹配的元素。
@@ -341,7 +394,7 @@ func cmdElementClick(_ id: Any?, _ p: [String: Any]) {
         respondOk(id, ["pressed": true])
         return
     }
-    // 路径 B：取元素 bounds 中心做坐标点击（v0.5.5：定向鼠标不可信，postClick 内部降级全局并回执）
+    // 路径 B：取元素 bounds 中心做坐标点击（v1.1.0：合成激活 + 定向投递；找不到目标窗口才全局兜底）
     guard let pos = axPointOrSize(axAttr(el, kAXPositionAttribute)),
           let size = axPointOrSize(axAttr(el, kAXSizeAttribute)), size[0] > 0, size[1] > 0 else {
         respondErr(id, "元素无 bounds，无法坐标兜底", code: "no-bounds")
@@ -350,15 +403,193 @@ func cmdElementClick(_ id: Any?, _ p: [String: Any]) {
     let cx = pos[0] + size[0] / 2
     let cy = pos[1] + size[1] / 2
     let d = postClick(pid, cx, cy)
+    if d.noWindow {
+        respondErr(id, "元素 bounds 处没有目标窗口（可能在别的桌面/已最小化）；未执行坐标兜底，避免误点前台应用", code: "no-window-at-point")
+        return
+    }
+    if d.eventBuildFailed {
+        respondErr(id, "无法构造定向鼠标事件；未执行坐标兜底（避免全局盲点）", code: "click-event-failed")
+        return
+    }
     var out: [String: Any] = ["xyFallback": true, "bounds": ["x": pos[0], "y": pos[1], "w": size[0], "h": size[1]], "at": [cx, cy]]
+    if d.targeted { out["targeted"] = true }
+    if d.syntheticFocus { out["syntheticFocus"] = true }
     if d.fallbackGlobal { out["fallback"] = "global" }
-    if d.focusedFirst { out["focusedFirst"] = true }
-    if let covered = d.coveredBy { out["coveredBy"] = covered }
     if let wid = d.windowId { out["windowId"] = wid }
     respondOk(id, out)
 }
 
-// ---------- 事件投递（v0.5.5：hidSystemState 事件源 + 定向鼠标降级全局） ----------
+// ---------- AX 属性写入 / 次级动作（v1.1.1） ----------
+
+/** 用 AXValue 直接替换可编辑元素的值（不移动鼠标/不抢焦点）。 */
+func cmdSetValue(_ id: Any?, _ p: [String: Any]) {
+    guard axTrusted() else { respondErr(id, AX_NOT_GRANTED_HINT, code: "not-granted"); return }
+    guard let pid = p["pid"] as? Int, pid > 0, let role = p["role"] as? String, !role.isEmpty,
+          let value = p["value"] as? String else {
+        respondErr(id, "set-value 需要 pid、role 与 value（title 可选）", code: "bad-args")
+        return
+    }
+    let wantTitle = p["title"] as? String
+    let title = (wantTitle?.isEmpty ?? true) ? nil : wantTitle
+    let app = AXUIElementCreateApplication(pid_t(pid))
+    guard let el = axFind(app, 0, role, title) else {
+        respondErr(id, "未找到匹配元素 role=\(role) title=\(title ?? "")（先用 ax-tree 核对）", code: "element-not-found")
+        return
+    }
+    showPiP(for: el, pid: pid_t(pid))
+    var settable = DarwinBoolean(false)
+    guard AXUIElementIsAttributeSettable(el, kAXValueAttribute as CFString, &settable) == .success,
+          settable.boolValue else {
+        respondErr(id, "元素 role=\(role) 的 AXValue 不可写（不同控件支持不同；可用 ax-tree 查看 value/actions）", code: "value-not-settable")
+        return
+    }
+    let err = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, value as CFString)
+    guard err == .success else {
+        respondErr(id, "AXValue 写入失败（AXError \(err.rawValue)）", code: "set-value-failed")
+        return
+    }
+    // 回读校验（尽力而为：部分控件读回格式不同，verified=false 不代表写入失败）
+    var readRef: CFTypeRef?
+    var verified = false
+    if AXUIElementCopyAttributeValue(el, kAXValueAttribute as CFString, &readRef) == .success,
+       let read = readRef as? String {
+        verified = read == value
+    }
+    let out: [String: Any] = [
+        "set": true, "verified": verified, "role": role, "title": title ?? "",
+        "valueLength": value.utf16.count,
+    ]
+    respondOk(id, out)
+}
+
+/** 执行元素暴露的次级 AX 动作（Raise / Expand / Collapse / Show Menu 等）。 */
+func cmdPerformAction(_ id: Any?, _ p: [String: Any]) {
+    guard axTrusted() else { respondErr(id, AX_NOT_GRANTED_HINT, code: "not-granted"); return }
+    guard let pid = p["pid"] as? Int, pid > 0, let role = p["role"] as? String, !role.isEmpty,
+          let action = p["action"] as? String, !action.isEmpty else {
+        respondErr(id, "action 需要 pid、role 与 action（title 可选）", code: "bad-args")
+        return
+    }
+    let wantTitle = p["title"] as? String
+    let title = (wantTitle?.isEmpty ?? true) ? nil : wantTitle
+    let app = AXUIElementCreateApplication(pid_t(pid))
+    guard let el = axFind(app, 0, role, title) else {
+        respondErr(id, "未找到匹配元素 role=\(role) title=\(title ?? "")（先用 ax-tree 核对）", code: "element-not-found")
+        return
+    }
+    showPiP(for: el, pid: pid_t(pid))
+    var namesRef: CFArray?
+    var actions: [String] = []
+    if AXUIElementCopyActionNames(el, &namesRef) == .success, let names = namesRef as? [String] {
+        actions = names
+    }
+    let matched = actions.first { $0 == action }
+        ?? actions.first { $0.caseInsensitiveCompare(action) == .orderedSame }
+    guard let perform = matched else {
+        respondErr(id, "元素不支持动作「\(action)」；可用动作: \(actions.isEmpty ? "（无）" : actions.joined(separator: ", "))", code: "action-not-available")
+        return
+    }
+    let err = AXUIElementPerformAction(el, perform as CFString)
+    guard err == .success else {
+        respondErr(id, "AX 动作执行失败（AXError \(err.rawValue)）", code: "action-failed")
+        return
+    }
+    respondOk(id, ["performed": true, "action": perform, "availableActions": actions])
+}
+
+/** 在可编辑元素里选中文本（AXSelectedTextRange），或把光标放到匹配文本前/后。 */
+func cmdSelectText(_ id: Any?, _ p: [String: Any]) {
+    guard axTrusted() else { respondErr(id, AX_NOT_GRANTED_HINT, code: "not-granted"); return }
+    guard let pid = p["pid"] as? Int, pid > 0, let role = p["role"] as? String, !role.isEmpty,
+          let text = p["text"] as? String, !text.isEmpty else {
+        respondErr(id, "select-text 需要 pid、role 与 text（title/prefix/suffix 可选）", code: "bad-args")
+        return
+    }
+    let selection = (p["selection"] as? String) ?? "text"
+    guard ["text", "cursor_before", "cursor_after"].contains(selection) else {
+        respondErr(id, "selection 需为 text / cursor_before / cursor_after", code: "bad-args")
+        return
+    }
+    let wantTitle = p["title"] as? String
+    let title = (wantTitle?.isEmpty ?? true) ? nil : wantTitle
+    let prefix = (p["prefix"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+    let suffix = (p["suffix"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+    let app = AXUIElementCreateApplication(pid_t(pid))
+    guard let el = axFind(app, 0, role, title) else {
+        respondErr(id, "未找到匹配元素 role=\(role) title=\(title ?? "")（先用 ax-tree 核对）", code: "element-not-found")
+        return
+    }
+    guard let value = axAttr(el, kAXValueAttribute) as? String else {
+        respondErr(id, "元素 role=\(role) 没有可读的 AXValue 文本", code: "value-not-readable")
+        return
+    }
+    let ns = value as NSString
+    let search = (prefix ?? "") + text + (suffix ?? "")
+    var hit = ns.range(of: search)
+    if hit.location == NSNotFound { // 带上下文没命中时退回纯 text（调用方的 prefix/suffix 可能不精确）
+        hit = ns.range(of: text)
+    }
+    guard hit.location != NSNotFound else {
+        respondErr(id, "元素文本里找不到目标文本（长度 \(text.utf16.count)）", code: "text-not-found")
+        return
+    }
+    var target = hit
+    if hit.length == (search as NSString).length { // 命中的是带上下文的整段，扣掉上下文
+        if let prefix = prefix { target.location += (prefix as NSString).length }
+        target.length = (text as NSString).length
+    } else {
+        target = ns.range(of: text)
+        if target.location == NSNotFound {
+            respondErr(id, "元素文本里找不到目标文本", code: "text-not-found")
+            return
+        }
+    }
+    let sel: CFRange
+    switch selection {
+    case "cursor_before": sel = CFRange(location: target.location, length: 0)
+    case "cursor_after": sel = CFRange(location: target.location + target.length, length: 0)
+    default: sel = CFRange(location: target.location, length: target.length)
+    }
+    // 尽力先聚焦元素
+    var focusSettable = DarwinBoolean(false)
+    if AXUIElementIsAttributeSettable(el, kAXFocusedAttribute as CFString, &focusSettable) == .success,
+       focusSettable.boolValue {
+        AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+    }
+    var range = sel
+    guard let axRange = AXValueCreate(.cfRange, &range) else {
+        respondErr(id, "无法构造 CFRange", code: "selection-failed")
+        return
+    }
+    var settable = DarwinBoolean(false)
+    guard AXUIElementIsAttributeSettable(el, kAXSelectedTextRangeAttribute as CFString, &settable) == .success,
+          settable.boolValue else {
+        respondErr(id, "元素 role=\(role) 不支持 AXSelectedTextRange（可先用 element-click 聚焦再 type）", code: "selection-not-settable")
+        return
+    }
+    let err = AXUIElementSetAttributeValue(el, kAXSelectedTextRangeAttribute as CFString, axRange)
+    guard err == .success else {
+        respondErr(id, "AXSelectedTextRange 写入失败（AXError \(err.rawValue)）", code: "selection-failed")
+        return
+    }
+    var verified = false
+    var readRef: CFTypeRef?
+    if AXUIElementCopyAttributeValue(el, kAXSelectedTextRangeAttribute as CFString, &readRef) == .success,
+       let rv = readRef, CFGetTypeID(rv) == AXValueGetTypeID() {
+        var rr = CFRange()
+        if AXValueGetValue(unsafeBitCast(rv, to: AXValue.self), .cfRange, &rr) {
+            verified = rr.location == sel.location && rr.length == sel.length
+        }
+    }
+    showPiP(for: el, pid: pid_t(pid))
+    respondOk(id, [
+        "selected": true, "verified": verified, "selection": selection,
+        "range": ["location": sel.location, "length": sel.length],
+        "textLength": text.utf16.count,
+    ])
+}
+
+// ---------- 事件投递（v0.5.5：hidSystemState 事件源；v1.1.0：定向鼠标经合成激活后可用） ----------
 
 /**
  * 键盘/鼠标事件统一用 HID 系统状态源创建。combinedSessionState 合成的事件不带真实 HID 修饰键状态，
@@ -391,14 +622,12 @@ func focusApp(_ pid: pid_t) -> (raised: Bool, activated: Bool) {
 let FIELD_WIN_UNDER_POINTER = CGEventField(rawValue: 91)!
 let FIELD_WIN_CAN_HANDLE = CGEventField(rawValue: 92)!
 
-/** pid 在屏上（常规层）的窗口：优先取包含 (x,y) 的，否则第一张；返回 (windowId, bounds)。 */
-func onScreenWindow(_ pid: pid_t, _ x: Double, _ y: Double) -> (windowId: Int, bounds: CGRect)? {
-    var fallback: (Int, CGRect)?
+/** pid 在屏上（常规层）且包含 (x,y) 的窗口；没有则 nil（调用方回退全局，避免落到窗外静默无效）。 */
+func windowContaining(_ pid: pid_t, _ x: Double, _ y: Double) -> (windowId: Int, bounds: CGRect)? {
     for w in onScreenWindows() where w.pid == Int(pid) {
         if w.bounds.contains(CGPoint(x: x, y: y)) { return (w.windowId, w.bounds) }
-        if fallback == nil { fallback = (w.windowId, w.bounds) }
     }
-    return fallback
+    return nil
 }
 
 /** 在屏常规层窗口快照（CGWindowList 本就按前→后 z 序返回）。 */
@@ -422,54 +651,281 @@ func onScreenWindows() -> [(windowId: Int, pid: Int, ownerName: String, bounds: 
     return out
 }
 
-/** 一次点击的投递方式回执：targeted=真定向（仅键盘语义可保）；fallbackGlobal=走了全局降级。 */
+// ---------- 合成激活（v1.1.0）：让目标应用“以为自己在前台”，不改真实前台、不动真实光标 ----------
+//
+// Codex Computer Use 的实测机制（REA 静态分析 + 本机复现）：
+//   1. 向目标 pid 投递一个 NSEvent(type=13 AppKitDefined, subtype=1 ApplicationActivated) 的
+//      CGEvent。目标应用的 NSApplication 会收到 applicationDidBecomeActive 并把它的 keyWindow
+//      立起来，但 WindowServer 的真实前台应用不变（用户无感）。
+//   2. 定向鼠标事件不是直接 CGEvent(mouseEventSource:)，而是先用
+//      NSEvent.mouseEvent(..., windowNumber: 目标窗口) 造事件、再取 cgEvent——这样事件才带
+//      窗口归属，AppKit 才会把它派发到目标窗口（否则 NSEvent.windowNumber=0，事件被丢弃）。
+//   3. 收尾时投递 subtype=2 ApplicationDeactivated，目标应用恢复“未激活”状态。
+
+let SYNTHETIC_FOCUS_TTL: TimeInterval = 5.0 // 最后一次动作后 5s 自动反激活
+let syntheticFocusLock = NSLock()
+var syntheticFocusPid: pid_t = 0
+var syntheticFocusGeneration = 0 // 每次激活/反激活自增；过期定时器据此失效（避免误伤新目标）
+var syntheticFocusTimer: DispatchWorkItem?
+var syntheticFocusSignalSources: [DispatchSourceSignal] = []
+
+/** 应用是否真的是当前前台（合成激活不会改变这个判断）。 */
+func frontmostPid() -> pid_t? {
+    NSWorkspace.shared.frontmostApplication?.processIdentifier
+}
+
+/** 投递 AppKitDefined 事件：subtype 1=ApplicationActivated / 2=ApplicationDeactivated。 */
+func postAppKitDefined(_ pid: pid_t, subtype: Int16) {
+    guard let ev = NSEvent.otherEvent(with: .appKitDefined, location: .zero, modifierFlags: [],
+                                      timestamp: ProcessInfo.processInfo.systemUptime,
+                                      windowNumber: 0, context: nil, subtype: subtype,
+                                      data1: 0, data2: 0),
+          let cg = ev.cgEvent else { return }
+    cg.postToPid(pid)
+}
+
+/** 确保目标应用“以为自己在前台”；返回是否真的做了合成激活（已在前台/同一 pid 返回 false）。 */
+@discardableResult
+func ensureSyntheticFocus(_ pid: pid_t) -> Bool {
+    guard pid > 0 else { return false }
+    if frontmostPid() == pid {
+        releaseSyntheticFocus()
+        return false
+    }
+    syntheticFocusLock.lock()
+    let previous = syntheticFocusPid
+    syntheticFocusPid = pid
+    syntheticFocusGeneration += 1
+    let generation = syntheticFocusGeneration
+    syntheticFocusTimer?.cancel()
+    let item = DispatchWorkItem { releaseSyntheticFocus(generation: generation) }
+    syntheticFocusTimer = item
+    syntheticFocusLock.unlock()
+
+    if previous != pid { // 先撤旧目标，再激活新目标
+        if previous > 0 { postAppKitDefined(previous, subtype: 2) }
+        postAppKitDefined(pid, subtype: 1)
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + SYNTHETIC_FOCUS_TTL, execute: item)
+    return true
+}
+
+// 最近一次交互窗口（pid → windowId/bounds）：键盘动作真激活时用它把目标窗口设为 main。
+let lastWindowLock = NSLock()
+var lastWindowByPid: [pid_t: (wid: Int, bounds: CGRect)] = [:]
+
+func rememberWindow(pid: pid_t, wid: Int, bounds: CGRect) {
+    lastWindowLock.lock()
+    lastWindowByPid[pid] = (wid, bounds)
+    lastWindowLock.unlock()
+}
+
+func rememberedWindow(_ pid: pid_t) -> (wid: Int, bounds: CGRect)? {
+    lastWindowLock.lock()
+    defer { lastWindowLock.unlock() }
+    return lastWindowByPid[pid]
+}
+
+/** 把目标窗口设为应用内 main window 并 raise（best effort）。
+ *  AppKit 只把定向鼠标事件派发给 key/main 窗口；同一应用内点击非 key 窗口时必须先做这一步，
+ *  否则事件带对了 windowNumber 也会被丢弃。只动应用内部窗口序，不做真实前台切换。 */
+func focusWindowForClick(_ pid: pid_t, _ bounds: CGRect) {
+    let app = AXUIElementCreateApplication(pid)
+    var ref: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &ref) == .success,
+          let windows = ref as? [AXUIElement] else { return }
+    var best: AXUIElement?
+    var bestScore = CGFloat.greatestFiniteMagnitude
+    for w in windows {
+        guard let pos = axPointOrSize(axAttr(w, kAXPositionAttribute)),
+              let size = axPointOrSize(axAttr(w, kAXSizeAttribute)) else { continue }
+        let score = abs(pos[0] - bounds.minX) + abs(pos[1] - bounds.minY)
+                  + abs(size[0] - bounds.width) + abs(size[1] - bounds.height)
+        if score < bestScore { bestScore = score; best = w }
+    }
+    guard let win = best else { return }
+    var mainRef: CFTypeRef?
+    let isMain = AXUIElementCopyAttributeValue(win, kAXMainAttribute as CFString, &mainRef) == .success
+        && (mainRef as? Bool) == true
+    if !isMain {
+        var settable = DarwinBoolean(false)
+        if AXUIElementIsAttributeSettable(win, kAXMainAttribute as CFString, &settable) == .success,
+           settable.boolValue {
+            AXUIElementSetAttributeValue(win, kAXMainAttribute as CFString, kCFBooleanTrue)
+        } else if AXUIElementIsAttributeSettable(win, kAXFocusedAttribute as CFString, &settable) == .success,
+                  settable.boolValue {
+            AXUIElementSetAttributeValue(win, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        }
+        AXUIElementPerformAction(win, kAXRaiseAction as CFString)
+    }
+}
+
+/** 用 AX 元素所在窗口定位 PiP 预览（匹配 CGWindow）；失败退回 pid 的第一张窗口。 */
+func showPiP(for element: AXUIElement, pid: pid_t) {
+    if let raw = axAttr(element, kAXWindowAttribute) {
+        let win = unsafeBitCast(raw, to: AXUIElement.self)
+        if let pos = axPointOrSize(axAttr(win, kAXPositionAttribute)),
+           let size = axPointOrSize(axAttr(win, kAXSizeAttribute)) {
+            let b = CGRect(x: pos[0], y: pos[1], width: size[0], height: size[1])
+            if let w = onScreenWindows().first(where: {
+                $0.pid == Int(pid) && abs($0.bounds.minX - b.minX) < 4 && abs($0.bounds.minY - b.minY) < 4
+            }) {
+                rememberWindow(pid: pid, wid: w.windowId, bounds: w.bounds)
+                controlPiP.show(pid: pid, windowId: w.windowId, windowBounds: w.bounds)
+                return
+            }
+        }
+    }
+    controlPiP.show(pid: pid)
+}
+
+/** 反激活（幂等）：目标若已真的在前台则不发，避免把它“说”成未激活。
+ *  generation 非空时只处理同代定时器（旧的 5s 定时器不能误伤后来重新激活的目标）。 */
+func releaseSyntheticFocus(generation: Int? = nil) {
+    syntheticFocusLock.lock()
+    if let g = generation, g != syntheticFocusGeneration {
+        syntheticFocusLock.unlock()
+        return
+    }
+    syntheticFocusGeneration += 1
+    syntheticFocusTimer?.cancel()
+    syntheticFocusTimer = nil
+    let pid = syntheticFocusPid
+    syntheticFocusPid = 0
+    syntheticFocusLock.unlock()
+    controlPiP.hide()
+    guard pid > 0, frontmostPid() != pid else { return }
+    postAppKitDefined(pid, subtype: 2)
+}
+
+// ---------- 键盘专用真实激活（v1.1.3） ----------
+//
+// 本机实测：合成激活能让 App 收到鼠标/AX 事件，但 macOS 26 不再把后台 App 的
+// CGEventPostToPid 键盘事件派发给它（带 windowNumber 的 NSEvent.keyEvent 也一样）。
+// Codex 用的是私有 SAIVirtualKeyPress，公开 API 无法等价复刻。务实方案：键盘/粘贴
+// 动作短暂真激活目标 App（窗口设为 main），发完键后恢复原前台；鼠标/AX 动作仍走
+// 合成激活，不抢前台。
+
+struct KeyboardFocus {
+    var requested = false
+    var activated = false
+    var previousPid: pid_t = 0
+    var targetPid: pid_t = 0
+}
+
+func activateForKeyboard(_ pid: pid_t, window: (wid: Int, bounds: CGRect)?) -> KeyboardFocus {
+    var f = KeyboardFocus(targetPid: pid)
+    if frontmostPid() == pid { return f } // 已真前台，直接发
+    f.requested = true
+    f.previousPid = frontmostPid() ?? 0
+    releaseSyntheticFocus() // 键盘走真激活，先清掉合成状态
+    if let w = window { focusWindowForClick(pid, w.bounds) }
+    if let app = NSRunningApplication(processIdentifier: pid) {
+        _ = app.activate(options: [.activateAllWindows])
+    }
+    for _ in 0..<12 { // 最多约 300ms
+        usleep(25_000)
+        if frontmostPid() == pid { f.activated = true; break }
+    }
+    return f
+}
+
+/** 键盘发完后恢复原前台；用户中途切走则不抢。 */
+func restoreAfterKeyboard(_ f: KeyboardFocus) {
+    guard f.requested, f.activated, f.previousPid > 0, f.previousPid != f.targetPid else { return }
+    guard frontmostPid() == f.targetPid else { return }
+    usleep(60_000) // 给目标应用处理完按键/粘贴
+    if let prev = NSRunningApplication(processIdentifier: f.previousPid) {
+        _ = prev.activate(options: [])
+    }
+    controlPiP.hide()
+}
+
+/** 键盘动作真激活失败时的统一错误（无窗口/无 bundle 的后台进程）。 */
+let KEYBOARD_FOCUS_ERROR = "无法把目标应用切到前台，键盘事件无法可靠投递；可改用 cua_set_value / cua_paste（需要前台）或 cua_app_focus"
+
+
+/** 一次点击的投递方式回执：targeted=定向到目标窗口（不抢前台、不动真光标）；fallbackGlobal=全局降级。 */
 struct ClickDelivery {
     var targeted = false
     var fallbackGlobal = false
-    var focusedFirst = false
+    var syntheticFocus = false
+    var noWindow = false // 给了 pid 但点击点没有目标窗口：不点，避免误点前台
+    var eventBuildFailed = false // 定向事件构造失败：不点，避免全局盲点
     var windowId: Int? = nil
-    var coveredBy: String? = nil // 点击点当前最上层窗口属于别的应用（已代为 raise，仍如实回执）
 }
 
-/**
- * 鼠标点击（v0.5.5）。实测（Chromium 系网页 + 原生应用）CGEventPostToPid 的鼠标事件在现代系统
- * 一律不生效：窗口服务器按真实光标位置 hit-testing，进程定向投递绕过了这一步，目标应用直接忽略。
- * 因此有 pid 时：①关联目标窗口字段（尽力而为）②点击点最上层不是目标窗口（目标不前台/被别的窗口
- * 盖住）先 focusApp 把它带到最前——否则全局注入按屏幕坐标 hit-testing 会点在遮挡窗口上
- * ③全局注入（唯一可靠路径，会移动真实光标）——调用方应答必须带 fallback:"global"。
- */
-func postClick(_ pid: Int?, _ x: Double, _ y: Double) -> ClickDelivery {
-    var d = ClickDelivery()
+/** 全局注入（会移动真实光标）——仅无 pid / 找不到目标窗口时兜底。 */
+func postGlobalClick(_ pt: CGPoint) {
     let src = eventSource()
-    let pt = CGPoint(x: x, y: y)
     guard let down = CGEvent(mouseEventSource: src, mouseType: .leftMouseDown, mouseCursorPosition: pt, mouseButton: .left),
-          let up = CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) else {
-        return d
-    }
-    if let pid = pid, pid > 0 {
-        if let (wid, _) = onScreenWindow(pid_t(pid), x, y) {
-            d.windowId = wid
-            for e in [down, up] { // 关联目标窗口：部分应用的事件路由会参考（对本机实测无碍）
-                e.setIntegerValueField(FIELD_WIN_UNDER_POINTER, value: Int64(wid))
-                e.setIntegerValueField(FIELD_WIN_CAN_HANDLE, value: Int64(wid))
-            }
-        }
-        // 点击点当前最上层窗口（z 序第一）不是目标的：目标不前台、或被其他应用窗口盖住。
-        // 全局注入认屏幕坐标不认 pid——先把目标 raise 到最前，点击才落在它的窗口上。
-        let topAtPoint = onScreenWindows().first { $0.bounds.contains(pt) }
-        if let top = topAtPoint, top.pid != pid {
-            d.coveredBy = top.ownerName.isEmpty ? "pid \(top.pid)" : top.ownerName
-        }
-        if d.coveredBy != nil || NSWorkspace.shared.frontmostApplication?.processIdentifier != pid_t(pid) {
-            focusApp(pid_t(pid))
-            d.focusedFirst = true
-            usleep(250_000) // 等窗口服务器完成前台切换
-        }
-        d.fallbackGlobal = true // 进程定向已不可信，统一走全局（如实回执）
-    }
+          let up = CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: pt, mouseButton: .left) else { return }
     down.post(tap: .cghidEventTap)
     usleep(10_000) // down/up 间隔 10ms：贴近真实点击，双击检测等时序才正常
     up.post(tap: .cghidEventTap)
+}
+
+/** 主屏高度（点）：NSEvent.cgEvent 的 y 翻转以主屏为基准。 */
+func mainScreenHeight() -> Double {
+    Double(CGDisplayBounds(CGMainDisplayID()).height)
+}
+
+/** 造一个带窗口归属的定向鼠标事件（NSEvent → cgEvent + 字段 3/7/91/92 + clickState）。 */
+func targetedMouseEvent(_ type: NSEvent.EventType, screenPt: CGPoint, bounds: CGRect, wid: Int,
+                        clickCount: Int = 1) -> CGEvent? {
+    let wx = screenPt.x - bounds.minX
+    let wy = bounds.maxY - screenPt.y
+    let inputY = mainScreenHeight() - bounds.height + wy
+    guard let ne = NSEvent.mouseEvent(with: type, location: NSPoint(x: wx, y: inputY),
+                                      modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                      windowNumber: wid, context: nil, eventNumber: 0,
+                                      clickCount: clickCount, pressure: 1.0),
+          let e = ne.cgEvent else { return nil }
+    e.setIntegerValueField(.mouseEventButtonNumber, value: 0)
+    e.setIntegerValueField(CGEventField(rawValue: 7)!, value: 3) // NSEventSubtypeMouseEvent
+    e.setIntegerValueField(FIELD_WIN_UNDER_POINTER, value: Int64(wid))
+    e.setIntegerValueField(FIELD_WIN_CAN_HANDLE, value: Int64(wid))
+    e.setIntegerValueField(.mouseEventClickState, value: Int64(clickCount))
+    return e
+}
+
+/**
+ * 鼠标点击（v1.1.0）。有 pid 且能定位目标窗口时：
+ *   ① 合成激活（目标“以为”自己在前台，真实前台不变）
+ *   ② 同一应用内非 key 窗口：AX 设为应用内 main window + raise（只动应用内部窗口序）
+ *   ③ 用 NSEvent.mouseEvent(windowNumber: 目标窗口) 造 down/up，取 cgEvent，补窗口关联字段
+ *   ④ postToPid 定向投递——事件带窗口归属，落到目标窗口，真实光标不动
+ * 无 pid：全局注入（会移动真实光标，如实回执 fallbackGlobal）。
+ * 有 pid 但点击点没有目标窗口：不点（noWindow=true），避免误点当前前台应用。
+ */
+func postClick(_ pid: Int?, _ x: Double, _ y: Double) -> ClickDelivery {
+    var d = ClickDelivery()
+    let pt = CGPoint(x: x, y: y)
+    guard let pid = pid, pid > 0 else {
+        postGlobalClick(pt)
+        d.fallbackGlobal = true
+        return d
+    }
+    guard let (wid, bounds) = windowContaining(pid_t(pid), x, y) else {
+        d.noWindow = true // 目标可能在别的桌面/已最小化：不盲点前台应用
+        return d
+    }
+    d.windowId = wid
+    rememberWindow(pid: pid_t(pid), wid: wid, bounds: bounds)
+    d.syntheticFocus = ensureSyntheticFocus(pid_t(pid))
+    if d.syntheticFocus { usleep(20_000) } // 等目标应用处理 activation（keyWindow 就位）
+    focusWindowForClick(pid_t(pid), bounds) // 非 key 窗口先设为应用内 main，否则事件会被丢弃
+    controlPiP.show(pid: pid_t(pid), windowId: wid, windowBounds: bounds) // 常驻控制指示器
+
+    guard let down = targetedMouseEvent(.leftMouseDown, screenPt: pt, bounds: bounds, wid: wid),
+          let up = targetedMouseEvent(.leftMouseUp, screenPt: pt, bounds: bounds, wid: wid) else {
+        d.eventBuildFailed = true // 有 pid 时不全局盲点
+        return d
+    }
+    down.postToPid(pid_t(pid))
+    usleep(10_000)
+    up.postToPid(pid_t(pid))
+    d.targeted = true
     return d
 }
 
@@ -480,21 +936,223 @@ func cmdXyClick(_ id: Any?, _ p: [String: Any]) {
     }
     let pid = p["pid"] as? Int
     let d = postClick(pid, x, y)
+    if d.noWindow {
+        respondErr(id, "目标 pid 在 (\(x),\(y)) 没有可点击窗口（可能在别的桌面/已最小化）；未执行，避免误点前台应用", code: "no-window-at-point")
+        return
+    }
+    if d.eventBuildFailed {
+        respondErr(id, "无法构造定向鼠标事件；未执行（避免全局盲点）", code: "click-event-failed")
+        return
+    }
     var out: [String: Any] = ["x": x, "y": y, "targeted": d.targeted]
-    if d.fallbackGlobal {
+    if d.targeted {
+        out["mode"] = "targeted"
+        out["syntheticFocus"] = d.syntheticFocus
+        out["note"] = d.syntheticFocus
+            ? "定向投递：目标应用已被合成激活（真实前台不变、真实光标不动）"
+            : "定向投递：目标已是前台（不移动真实光标）"
+    } else if d.fallbackGlobal {
         out["fallback"] = "global"
-        var note = "进程定向鼠标注入在现代系统不生效：已"
-        if let covered = d.coveredBy { note += "把被「\(covered)」遮挡的目标置前并" }
-        else if d.focusedFirst { note += "把目标带到前台并" }
-        note += "全局注入（会移动真实光标）"
-        out["note"] = note
-    } else if (pid ?? 0) <= 0 {
         out["note"] = "无 pid：全局投递（会移动真实光标）"
     }
-    if d.focusedFirst { out["focusedFirst"] = true }
-    if let covered = d.coveredBy { out["coveredBy"] = covered }
     if let wid = d.windowId { out["windowId"] = wid }
     respondOk(id, out)
+}
+
+// ---------- scroll / drag（v1.1.2：定向滚动与拖拽，复用合成激活 + 窗口归属） ----------
+
+/** 在 point 下找 AXScrollArea，改对应滚动条的 AXValue（标准 AppKit 滚动区通用）。
+ *  AXScrollDownByPage 等动作在 macOS 26 上会返回 -25205，滚条 value 才是可靠路径。 */
+struct AxScrollBarResult {
+    var ok = false
+    var bar = ""
+    var value: Double = 0
+    var verified = false
+}
+
+func axScrollBarAt(_ point: CGPoint, _ direction: String, _ pages: Int) -> AxScrollBarResult {
+    var result = AxScrollBarResult()
+    let sys = AXUIElementCreateSystemWide()
+    var ref: AXUIElement?
+    guard AXUIElementCopyElementAtPosition(sys, Float(point.x), Float(point.y), &ref) == .success,
+          var el = ref else { return result }
+    for _ in 0..<12 {
+        if (axAttr(el, kAXRoleAttribute) as? String) == "AXScrollArea" { break }
+        var parentRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXParentAttribute as CFString, &parentRef) == .success,
+              let p = parentRef else { return result }
+        el = unsafeBitCast(p, to: AXUIElement.self)
+    }
+    guard (axAttr(el, kAXRoleAttribute) as? String) == "AXScrollArea" else { return result }
+    let vertical = (direction == "up" || direction == "down")
+    let attr = vertical ? kAXVerticalScrollBarAttribute : kAXHorizontalScrollBarAttribute
+    var barRef: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(el, attr as CFString, &barRef) == .success,
+          let barRef = barRef else { return result }
+    let bar = unsafeBitCast(barRef, to: AXUIElement.self)
+    var valueRef: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(bar, kAXValueAttribute as CFString, &valueRef) == .success,
+          let old = (valueRef as? NSNumber)?.doubleValue else { return result }
+    var settable = DarwinBoolean(false)
+    guard AXUIElementIsAttributeSettable(bar, kAXValueAttribute as CFString, &settable) == .success,
+          settable.boolValue else { return result }
+    let step = 0.1 * Double(max(1, pages))
+    let target = (direction == "down" || direction == "right")
+        ? min(1.0, old + step) : max(0.0, old - step)
+    guard AXUIElementSetAttributeValue(bar, kAXValueAttribute as CFString,
+                                       NSNumber(value: target)) == .success else { return result }
+    result.ok = true
+    result.bar = vertical ? "vertical" : "horizontal"
+    result.value = target
+    var readRef: CFTypeRef?
+    if AXUIElementCopyAttributeValue(bar, kAXValueAttribute as CFString, &readRef) == .success,
+       let read = (readRef as? NSNumber)?.doubleValue {
+        result.verified = abs(read - target) < 0.001
+    }
+    return result
+}
+
+func cmdScroll(_ id: Any?, _ p: [String: Any]) {
+    guard let pid = p["pid"] as? Int, pid > 0 else {
+        respondErr(id, "scroll 需要 pid", code: "bad-args")
+        return
+    }
+    var point: CGPoint?
+    let x = (p["x"] as? NSNumber)?.doubleValue
+    let y = (p["y"] as? NSNumber)?.doubleValue
+    if let x = x, let y = y, x.isFinite, y.isFinite {
+        point = CGPoint(x: x, y: y)
+    } else if let role = p["role"] as? String, !role.isEmpty {
+        let wantTitle = p["title"] as? String
+        let title = (wantTitle?.isEmpty ?? true) ? nil : wantTitle
+        let app = AXUIElementCreateApplication(pid_t(pid))
+        if let el = axFind(app, 0, role, title),
+           let pos = axPointOrSize(axAttr(el, kAXPositionAttribute)),
+           let size = axPointOrSize(axAttr(el, kAXSizeAttribute)) {
+            point = CGPoint(x: pos[0] + size[0] / 2, y: pos[1] + size[1] / 2)
+        }
+    } else if let w = onScreenWindows().first(where: { $0.pid == pid }) {
+        point = CGPoint(x: w.bounds.midX, y: w.bounds.midY)
+    }
+    guard let pt = point else {
+        respondErr(id, "scroll 找不到可滚动窗口（目标可能在别的桌面/已最小化）", code: "no-window-at-point")
+        return
+    }
+    guard let (wid, bounds) = windowContaining(pid_t(pid), pt.x, pt.y) else {
+        respondErr(id, "scroll 的落点没有目标窗口；未执行", code: "no-window-at-point")
+        return
+    }
+    var dx: Int32 = 0
+    var dy: Int32 = 0
+    var direction: String? = nil
+    var pages = 1
+    if let d = p["direction"] as? String {
+        direction = d.lowercased()
+        pages = max(1, min(10, p["pages"] as? Int ?? 1))
+        let px = Int32(400 * pages)
+        switch direction! {
+        case "up": dy = px
+        case "down": dy = -px
+        case "left": dx = px
+        case "right": dx = -px
+        default:
+            respondErr(id, "direction 需为 up/down/left/right", code: "bad-args")
+            return
+        }
+    } else if let sx = p["scrollX"] as? Int, let sy = p["scrollY"] as? Int {
+        dx = Int32(sx)
+        dy = Int32(sy)
+    } else {
+        respondErr(id, "scroll 需要 direction/pages 或 scrollX/scrollY", code: "bad-args")
+        return
+    }
+    // 优先 AX 滚动条 value（后台可用、不依赖真实光标/窗口关联）；不支持时才回退滚轮事件。
+    if let direction = direction {
+        let ax = axScrollBarAt(pt, direction, pages)
+        if ax.ok {
+            rememberWindow(pid: pid_t(pid), wid: wid, bounds: bounds)
+            controlPiP.show(pid: pid_t(pid), windowId: wid, windowBounds: bounds)
+            respondOk(id, [
+                "scrolled": true, "via": "ax-scrollbar", "bar": ax.bar, "value": ax.value,
+                "verified": ax.verified, "pages": pages,
+                "dx": dx, "dy": dy, "steps": pages, "direction": direction,
+                "windowId": wid, "targeted": true, "syntheticFocus": false,
+            ])
+            return
+        }
+    }
+    let synth = ensureSyntheticFocus(pid_t(pid))
+    if synth { usleep(20_000) }
+    focusWindowForClick(pid_t(pid), bounds)
+    rememberWindow(pid: pid_t(pid), wid: wid, bounds: bounds)
+    controlPiP.show(pid: pid_t(pid), windowId: wid, windowBounds: bounds)
+    let steps = (direction == nil) ? 1 : pages
+    let src = eventSource()
+    for _ in 0..<steps {
+        guard let e = CGEvent(scrollWheelEvent2Source: src, units: .pixel, wheelCount: 2,
+                              wheel1: dy, wheel2: dx, wheel3: 0) else {
+            respondErr(id, "无法构造滚轮事件", code: "scroll-failed")
+            return
+        }
+        e.location = pt
+        e.setIntegerValueField(FIELD_WIN_UNDER_POINTER, value: Int64(wid))
+        e.setIntegerValueField(FIELD_WIN_CAN_HANDLE, value: Int64(wid))
+        e.postToPid(pid_t(pid))
+        usleep(10_000)
+    }
+    respondOk(id, [
+        "scrolled": true, "via": "event", "dx": dx, "dy": dy, "steps": steps,
+        "direction": direction ?? "", "windowId": wid,
+        "targeted": true, "syntheticFocus": synth,
+    ])
+}
+
+func cmdDrag(_ id: Any?, _ p: [String: Any]) {
+    guard let pid = p["pid"] as? Int, pid > 0,
+          let fx = (p["fromX"] as? NSNumber)?.doubleValue, let fy = (p["fromY"] as? NSNumber)?.doubleValue,
+          let tx = (p["toX"] as? NSNumber)?.doubleValue, let ty = (p["toY"] as? NSNumber)?.doubleValue,
+          fx.isFinite, fy.isFinite, tx.isFinite, ty.isFinite else {
+        respondErr(id, "drag 需要 pid 与 fromX/fromY/toX/toY（数字）", code: "bad-args")
+        return
+    }
+    let from = CGPoint(x: fx, y: fy)
+    let to = CGPoint(x: tx, y: ty)
+    guard let (wid, bounds) = windowContaining(pid_t(pid), from.x, from.y) else {
+        respondErr(id, "drag 起点没有目标窗口；未执行", code: "no-window-at-point")
+        return
+    }
+    let synth = ensureSyntheticFocus(pid_t(pid))
+    if synth { usleep(20_000) }
+    focusWindowForClick(pid_t(pid), bounds)
+    rememberWindow(pid: pid_t(pid), wid: wid, bounds: bounds)
+    controlPiP.show(pid: pid_t(pid), windowId: wid, windowBounds: bounds)
+    let steps = max(2, min(60, p["steps"] as? Int ?? 12))
+    let durationMs = max(30, min(2000, p["durationMs"] as? Int ?? 300))
+    let stepDelay = max(1, UInt32(Double(durationMs) * 1000.0 / Double(steps)))
+    guard let down = targetedMouseEvent(.leftMouseDown, screenPt: from, bounds: bounds, wid: wid) else {
+        respondErr(id, "无法构造拖拽按下事件", code: "drag-failed")
+        return
+    }
+    down.postToPid(pid_t(pid))
+    for i in 1...steps {
+        let t = Double(i) / Double(steps)
+        let pt = CGPoint(x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t)
+        if let e = targetedMouseEvent(.leftMouseDragged, screenPt: pt, bounds: bounds, wid: wid) {
+            usleep(stepDelay)
+            e.postToPid(pid_t(pid))
+        }
+    }
+    usleep(10_000)
+    guard let up = targetedMouseEvent(.leftMouseUp, screenPt: to, bounds: bounds, wid: wid) else {
+        respondErr(id, "无法构造拖拽释放事件", code: "drag-failed")
+        return
+    }
+    up.postToPid(pid_t(pid))
+    respondOk(id, [
+        "dragged": true, "from": [fx, fy], "to": [tx, ty], "steps": steps,
+        "durationMs": durationMs, "windowId": wid,
+        "targeted": true, "syntheticFocus": synth,
+    ])
 }
 
 // ---------- type / key ----------
@@ -509,6 +1167,17 @@ func cmdType(_ id: Any?, _ p: [String: Any]) {
         return
     }
     let pid = p["pid"] as? Int
+    var focus = KeyboardFocus()
+    if let pid = pid, pid > 0 {
+        let w = rememberedWindow(pid_t(pid))
+        focus = activateForKeyboard(pid_t(pid), window: w)
+        if focus.requested && !focus.activated {
+            respondErr(id, KEYBOARD_FOCUS_ERROR, code: "keyboard-focus-failed")
+            return
+        }
+        controlPiP.show(pid: pid_t(pid), windowId: w?.wid, windowBounds: w?.bounds)
+    }
+    defer { restoreAfterKeyboard(focus) }
     let src = eventSource()
     // 中文等非键码字符唯一可靠路径：CGEventKeyboardSetUnicodeString 把 UTF-16 文本直接塞进事件，
     // 绕过键码翻译与输入法合成。单事件上限 20 个 UTF-16 码元——必须按码元（而非 Character）
@@ -530,7 +1199,7 @@ func cmdType(_ id: Any?, _ p: [String: Any]) {
         sent += n
         i += n
     }
-    respondOk(id, ["chars": sent]) // 与 JS text.length 同口径（UTF-16 码元数）
+    respondOk(id, ["chars": sent, "realFocus": focus.activated]) // chars 与 JS text.length 同口径（UTF-16 码元数）
 }
 
 /** 常用键 → 虚拟键码（ANSI 布局）；字母数字直接查表。 */
@@ -589,6 +1258,17 @@ func cmdKey(_ id: Any?, _ p: [String: Any]) {
         }
     }
     let pid = p["pid"] as? Int
+    var focus = KeyboardFocus()
+    if let pid = pid, pid > 0 {
+        let w = rememberedWindow(pid_t(pid))
+        focus = activateForKeyboard(pid_t(pid), window: w)
+        if focus.requested && !focus.activated {
+            respondErr(id, KEYBOARD_FOCUS_ERROR, code: "keyboard-focus-failed")
+            return
+        }
+        controlPiP.show(pid: pid_t(pid), windowId: w?.wid, windowBounds: w?.bounds)
+    }
+    defer { restoreAfterKeyboard(focus) }
     let src = eventSource()
     guard let down = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(code), keyDown: true),
           let up = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(code), keyDown: false) else {
@@ -616,15 +1296,90 @@ func cmdKey(_ id: Any?, _ p: [String: Any]) {
         if let e = makeFlagsChange(src, m.code, false, held) { postEvent(pid, e) }
         usleep(5000)
     }
-    respondOk(id, ["key": lowered, "keyCode": code, "modifiers": names])
+    respondOk(id, ["key": lowered, "keyCode": code, "modifiers": names, "realFocus": focus.activated])
+}
+
+// ---------- paste（剪贴板 + ⌘V，完成后恢复原剪贴板） ----------
+
+/** 发送 ⌘V：沿用 cmdKey 的真实修饰键序列（flagsChange → keyDown → keyUp → flagsChange）。 */
+func sendCommandV(_ pid: Int?) {
+    let src = eventSource()
+    let code = CGKeyCode(KEY_CODES["v"] ?? 9)
+    if let e = makeFlagsChange(src, 0x37, true, .maskCommand) { postEvent(pid, e) }
+    usleep(5000)
+    if let down = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: true) {
+        down.flags = .maskCommand
+        postEvent(pid, down)
+    }
+    usleep(10000)
+    if let up = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: false) {
+        up.flags = .maskCommand
+        postEvent(pid, up)
+    }
+    usleep(5000)
+    if let e = makeFlagsChange(src, 0x37, false, []) { postEvent(pid, e) }
+}
+
+func cmdPaste(_ id: Any?, _ p: [String: Any]) {
+    guard let pid = p["pid"] as? Int, pid > 0, let text = p["text"] as? String, !text.isEmpty else {
+        respondErr(id, "paste 需要 pid 与非空 text", code: "bad-args")
+        return
+    }
+    let format = (p["format"] as? String) ?? "text"
+    guard ["text", "md", "html"].contains(format) else {
+        respondErr(id, "format 需为 text / md / html", code: "bad-format")
+        return
+    }
+    if text.utf16.count > 4000 {
+        respondErr(id, "text 过长（>4000 字符），请分段粘贴", code: "text-too-long")
+        return
+    }
+    let w = rememberedWindow(pid_t(pid))
+    let focus = activateForKeyboard(pid_t(pid), window: w)
+    if focus.requested && !focus.activated {
+        respondErr(id, KEYBOARD_FOCUS_ERROR, code: "keyboard-focus-failed")
+        return
+    }
+    defer { restoreAfterKeyboard(focus) }
+    controlPiP.show(pid: pid_t(pid), windowId: w?.wid, windowBounds: w?.bounds)
+    let pb = NSPasteboard.general
+    let saved = (pb.pasteboardItems ?? []).map { item -> NSPasteboardItem in
+        let copy = NSPasteboardItem()
+        for type in item.types {
+            if let data = item.data(forType: type) { copy.setData(data, forType: type) }
+        }
+        return copy
+    }
+    defer {
+        usleep(150_000) // 给目标应用读剪贴板的时间
+        pb.clearContents()
+        if !saved.isEmpty { pb.writeObjects(saved) }
+    }
+    pb.clearContents()
+    if format == "html" {
+        pb.setString(text, forType: .html)
+        pb.setString(text, forType: .string)
+    } else {
+        pb.setString(text, forType: .string)
+    }
+    sendCommandV(pid)
+    usleep(80_000)
+    respondOk(id, ["pasted": true, "chars": text.utf16.count, "format": format, "clipboardRestored": true, "realFocus": focus.activated])
 }
 
 // ---------- app-focus ----------
 
 func cmdAppFocus(_ id: Any?, _ p: [String: Any]) {
     guard let pid = p["pid"] as? Int, pid > 0 else { respondErr(id, "app-focus 需要 pid"); return }
+    releaseSyntheticFocus() // 真前台切换前先撤掉“目标以为自己在后台/前台”的合成状态
     let r = focusApp(pid_t(pid))
     respondOk(id, ["axRaised": r.raised, "appActivated": r.activated])
+}
+
+/** 显式撤销合成激活（幂等）；服务端收尾/切目标时可主动调用。 */
+func cmdReleaseFocus(_ id: Any?) {
+    releaseSyntheticFocus()
+    respondOk(id, ["released": true])
 }
 
 // ---------- 幽魂光标叠加层（overlay：AI 动手位置的可见化提示；真鼠标始终不动） ----------
@@ -775,6 +1530,304 @@ final class OverlayController {
 
 let overlay = OverlayController()
 
+// ---------- 常驻控制指示器（PiP-lite）：不抢焦点、点击穿透，显示目标窗口实时缩略图 ----------
+//
+// Codex 的 PiP 预览是其产品层的实时视频管线；这里用「目标窗口截图缩略图 + 琥珀标题条」
+// 做一个轻量等价物：每次动作时出现，1s 刷新一次，合成激活结束/5s 无动作后自动收起。
+// 窗口截图走 CGWindowListCreateImage（macOS 15 起 SDK 标记 obsolete，但系统符号仍在，
+// 用 dlsym 动态取；取不到时显示占位图，不影响控制功能）。
+
+private typealias CGWindowListCreateImageFn = @convention(c) (CGRect, UInt32, UInt32, UInt32) -> Unmanaged<CGImage>?
+
+private let cgWindowListCreateImage: CGWindowListCreateImageFn? = {
+    guard let handle = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY),
+          let sym = dlsym(handle, "CGWindowListCreateImage") else { return nil }
+    return unsafeBitCast(sym, to: CGWindowListCreateImageFn.self)
+}()
+
+final class ControlPiPView: NSView {
+    var appName = ""
+    var image: CGImage?
+    private let headerH: CGFloat = 28
+
+    override func draw(_ dirtyRect: NSRect) {
+        let bg = NSColor(srgbRed: 28 / 255, green: 24 / 255, blue: 18 / 255, alpha: 0.94)
+        let amber = NSColor(srgbRed: 245 / 255, green: 158 / 255, blue: 11 / 255, alpha: 1)
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 10, yRadius: 10)
+        bg.setFill(); path.fill()
+        amber.withAlphaComponent(0.45).setStroke(); path.lineWidth = 1; path.stroke()
+
+        let dot = NSRect(x: 10, y: bounds.height - headerH + 10, width: 8, height: 8)
+        amber.setFill(); NSBezierPath(ovalIn: dot).fill()
+        let title = "AgentDesk 正在操作 \(appName)" as NSString
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11.5, weight: .medium),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.92),
+        ]
+        let ts = title.size(withAttributes: attrs)
+        title.draw(at: NSPoint(x: 24, y: bounds.height - headerH + (headerH - ts.height) / 2), withAttributes: attrs)
+
+        let area = NSRect(x: 8, y: 8, width: bounds.width - 16, height: bounds.height - headerH - 8)
+        if let image {
+            let iw = CGFloat(image.width), ih = CGFloat(image.height)
+            let scale = min(area.width / iw, area.height / ih)
+            let draw = NSRect(x: area.midX - iw * scale / 2, y: area.midY - ih * scale / 2,
+                              width: iw * scale, height: ih * scale)
+            NSImage(cgImage: image, size: NSSize(width: iw, height: ih))
+                .draw(in: draw, from: .zero, operation: .sourceOver, fraction: 1)
+        } else {
+            let placeholder = "预览不可用" as NSString
+            let pa: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 12),
+                .foregroundColor: NSColor.white.withAlphaComponent(0.5),
+            ]
+            let ps = placeholder.size(withAttributes: pa)
+            placeholder.draw(at: NSPoint(x: area.midX - ps.width / 2, y: area.midY - ps.height / 2), withAttributes: pa)
+        }
+    }
+}
+
+/// ScreenCaptureKit 实时窗口流（macOS 12.3+）：桌面独立窗口捕获，15fps。
+/// 只负责取帧/生命周期，UI 更新由 ControlPiPController 回主线程处理。
+@available(macOS 12.3, *)
+final class PiPLiveStream: NSObject, SCStreamDelegate, SCStreamOutput {
+    var onFrame: ((CGImage) -> Void)?
+    var onStarted: (() -> Void)?
+    var onStop: (() -> Void)?
+    private var stream: SCStream?
+    private var stopped = false
+    private let queue = DispatchQueue(label: "agentdesk.pip.frames", qos: .userInitiated)
+    private let ciContext = CIContext(options: [.cacheIntermediates: false])
+
+    func start(windowID: Int) {
+        stopped = false
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { [weak self] content, error in
+            guard let self, !self.stopped else { return }
+            guard error == nil,
+                  let window = content?.windows.first(where: { $0.windowID == CGWindowID(windowID) }) else {
+                self.onStop?()
+                return
+            }
+            let filter = SCContentFilter(desktopIndependentWindow: window)
+            let config = SCStreamConfiguration()
+            config.width = 480
+            config.height = 360
+            config.minimumFrameInterval = CMTime(value: 1, timescale: 15)
+            config.queueDepth = 3
+            config.pixelFormat = kCVPixelFormatType_32BGRA
+            config.showsCursor = false
+            let stream = SCStream(filter: filter, configuration: config, delegate: self)
+            do {
+                try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.queue)
+            } catch {
+                self.onStop?()
+                return
+            }
+            self.stream = stream
+            stream.startCapture { [weak self] error in
+                guard let self, !self.stopped else { return }
+                if error != nil { self.onStop?() } else { self.onStarted?() }
+            }
+        }
+    }
+
+    func stop() {
+        stopped = true
+        stream?.stopCapture { _ in }
+        stream = nil
+        onFrame = nil
+        onStarted = nil
+        onStop = nil
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard !stopped, type == .screen,
+              let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let ci = CIImage(cvPixelBuffer: pixelBuffer)
+        guard let cg = ciContext.createCGImage(ci, from: ci.extent) else { return }
+        onFrame?(cg)
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        guard !stopped else { return }
+        onStop?()
+    }
+}
+
+final class ControlPiPController {
+    private var panel: NSPanel?
+    private var fallbackTimer: Timer?
+    private var hideItem: DispatchWorkItem?
+    private var generation = 0
+    private var windowId = 0
+    private var appName = ""
+    private let ttl: TimeInterval = SYNTHETIC_FOCUS_TTL + 1.0
+    private let size = NSSize(width: 240, height: 180)
+    private var liveStream: AnyObject?
+    private var liveToken = 0
+    private let stateLock = NSLock()
+    private var visible = false
+    private var via = "none"
+    private var frames = 0
+
+    /** 任意线程可调；pid 必须有窗口（通常由动作路径传入 windowId/bounds）。 */
+    func show(pid: pid_t, windowId: Int? = nil, windowBounds: CGRect? = nil) {
+        let app = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "应用"
+        let wid = windowId ?? onScreenWindows().first(where: { $0.pid == Int(pid) })?.windowId ?? 0
+        let bounds = windowBounds ?? onScreenWindows().first(where: { $0.pid == Int(pid) })?.bounds
+        DispatchQueue.main.async { [weak self] in
+            self?.showOnMain(appName: app, windowId: wid, windowBounds: bounds)
+        }
+    }
+
+    func hide() {
+        DispatchQueue.main.async { [weak self] in self?.hideOnMain() }
+    }
+
+    /** 诊断/自检用：当前预览状态（visible/via/frames/windowId）。 */
+    func status() -> [String: Any] {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return ["visible": visible, "via": via, "frames": frames, "windowId": windowId]
+    }
+
+    private func showOnMain(appName: String, windowId: Int, windowBounds: CGRect?) {
+        self.appName = appName
+        stateLock.lock()
+        self.windowId = windowId
+        visible = true
+        via = "starting"
+        frames = 0
+        stateLock.unlock()
+        let frame = panelFrame(windowBounds: windowBounds)
+        let p: NSPanel
+        if let existing = panel {
+            p = existing
+        } else {
+            p = NSPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            p.isFloatingPanel = true
+            p.level = .floating
+            p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            p.ignoresMouseEvents = true
+            p.hidesOnDeactivate = false
+            p.hasShadow = true
+            p.backgroundColor = .clear
+            p.isOpaque = false
+            p.contentView = ControlPiPView(frame: NSRect(origin: .zero, size: size))
+            panel = p
+        }
+        p.setFrame(frame, display: true)
+        if let v = p.contentView as? ControlPiPView {
+            v.frame = NSRect(origin: .zero, size: frame.size)
+            v.appName = appName
+            v.image = snapshot()
+            v.needsDisplay = true
+        }
+        p.alphaValue = 1
+        p.orderFrontRegardless()
+        generation += 1
+        let gen = generation
+        hideItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, gen == self.generation else { return }
+            self.hideOnMain()
+        }
+        hideItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + ttl, execute: item)
+        startLive(windowId: windowId)
+        startFallbackTimer() // 实时流启动前先用 1s 截图顶着；sc-stream 起来后会停掉
+    }
+
+    private func hideOnMain() {
+        generation += 1
+        hideItem?.cancel(); hideItem = nil
+        stateLock.lock()
+        visible = false
+        via = "none"
+        frames = 0
+        stateLock.unlock()
+        stopLive()
+        fallbackTimer?.invalidate(); fallbackTimer = nil
+        panel?.orderOut(nil)
+    }
+
+    private func startLive(windowId: Int) {
+        stopLive()
+        guard #available(macOS 12.3, *), windowId > 0 else { startFallbackTimer(); return }
+        liveToken += 1
+        let token = liveToken
+        let s = PiPLiveStream()
+        s.onStarted = { [weak self] in
+            guard let self else { return }
+            DispatchQueue.main.async {
+                guard token == self.liveToken, self.isVisibleNow() else { return }
+                self.fallbackTimer?.invalidate(); self.fallbackTimer = nil
+                self.stateLock.lock(); self.via = "sc-stream"; self.stateLock.unlock()
+            }
+        }
+        s.onFrame = { [weak self] cg in
+            guard let self else { return }
+            self.stateLock.lock(); self.frames += 1; self.stateLock.unlock()
+            DispatchQueue.main.async {
+                guard token == self.liveToken, self.isVisibleNow() else { return }
+                if let p = self.panel, let v = p.contentView as? ControlPiPView {
+                    v.image = cg
+                    v.needsDisplay = true
+                }
+            }
+        }
+        s.onStop = { [weak self] in
+            guard let self else { return }
+            DispatchQueue.main.async {
+                guard token == self.liveToken, self.isVisibleNow() else { return }
+                self.startFallbackTimer()
+            }
+        }
+        liveStream = s
+        s.start(windowID: windowId)
+    }
+
+    private func stopLive() {
+        liveToken += 1
+        if #available(macOS 12.3, *), let s = liveStream as? PiPLiveStream { s.stop() }
+        liveStream = nil
+    }
+
+    private func isVisibleNow() -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return visible
+    }
+
+    private func startFallbackTimer() {
+        fallbackTimer?.invalidate()
+        stateLock.lock(); via = "screenshot"; stateLock.unlock()
+        fallbackTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self, let p = self.panel, p.isVisible else { return }
+            if let v = p.contentView as? ControlPiPView {
+                v.image = self.snapshot()
+                v.needsDisplay = true
+            }
+        }
+    }
+
+    private func snapshot() -> CGImage? {
+        guard windowId > 0, let fn = cgWindowListCreateImage else { return nil }
+        return fn(.null, CGWindowListOption.optionIncludingWindow.rawValue, UInt32(windowId),
+                  CGWindowImageOption.boundsIgnoreFraming.rawValue)?.takeRetainedValue()
+    }
+
+    private func panelFrame(windowBounds: CGRect?) -> NSRect {
+        let screen = NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        var x = screen.width - size.width - 16
+        var top = 40.0
+        if let b = windowBounds, b.width > 40, b.height > 40 {
+            x = min(screen.width - size.width - 8, max(8, b.maxX - size.width - 12))
+            top = max(8, b.minY + 12)
+        }
+        return NSRect(x: x, y: screen.height - top - size.height, width: size.width, height: size.height)
+    }
+}
+let controlPiP = ControlPiPController()
+
 func cmdOverlayShow(_ id: Any?, _ p: [String: Any]) {
     guard let x = (p["x"] as? NSNumber)?.doubleValue, let y = (p["y"] as? NSNumber)?.doubleValue,
           x.isFinite, y.isFinite else {
@@ -803,6 +1856,11 @@ func cmdOverlayHide(_ id: Any?) {
         overlay.hide()
         respondOk(id, [:])
     }
+}
+
+/** 诊断/自检：PiP 预览状态（visible/via/frames/windowId）。 */
+func cmdPipStats(_ id: Any?) {
+    respondOk(id, controlPiP.status())
 }
 
 // ---------- 权限引导悬浮卡片（v0.5.4 起；v1.0.0 升级：560×124 大卡 + 贴靠系统设置 + 拖 .app 授权 + 授权自动检测） ----------
@@ -1313,13 +2371,22 @@ func handleLine(_ line: String) {
     case "request-permissions": cmdRequestPermissions(id, obj)
     case "windows": cmdWindows(id, obj)
     case "ax-tree": cmdAxTree(id, obj)
+    case "ax-hit": cmdAxHit(id, obj)
     case "element-click": cmdElementClick(id, obj)
+    case "set-value": cmdSetValue(id, obj)
+    case "perform-action": cmdPerformAction(id, obj)
+    case "select-text": cmdSelectText(id, obj)
+    case "paste": cmdPaste(id, obj)
+    case "scroll": cmdScroll(id, obj)
+    case "drag": cmdDrag(id, obj)
     case "xy-click": cmdXyClick(id, obj)
     case "type": cmdType(id, obj)
     case "key": cmdKey(id, obj)
     case "app-focus": cmdAppFocus(id, obj)
+    case "release-focus": cmdReleaseFocus(id)
     case "overlay-show": cmdOverlayShow(id, obj)
     case "overlay-hide": cmdOverlayHide(id)
+    case "pip-stats": cmdPipStats(id)
     case "show-permission-card": cmdShowPermissionCard(id, obj)
     case "hide-permission-card": cmdHidePermissionCard(id, obj)
     default: respondErr(id, "未知命令: \(cmd)", code: "unknown-cmd")
@@ -1329,10 +2396,26 @@ func handleLine(_ line: String) {
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory) // 无 Dock 图标；叠加窗 orderFrontRegardless 显示、绝不 activate
 
+/** 进程被服务端 SIGTERM 收掉时先撤销合成激活，避免目标应用停在“以为自己在前台”的状态。 */
+func installSyntheticFocusSignalHandlers() {
+    for sig in [SIGTERM, SIGINT] {
+        signal(sig, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+        source.setEventHandler {
+            releaseSyntheticFocus()
+            exit(0)
+        }
+        source.resume()
+        syntheticFocusSignalSources.append(source)
+    }
+}
+installSyntheticFocusSignalHandlers()
+
 DispatchQueue.global(qos: .userInitiated).async {
     while let line = readLine() {
         autoreleasepool { handleLine(line) }
     }
+    releaseSyntheticFocus() // stdin 关闭：撤销合成激活后再退出
     // stdin EOF：结束主线程 run loop（terminate），保持旧版「管道关闭即退出」的行为；
     // 权限引导卡片还在屏上时留守到卡片全数收起（setup 非交互留卡场景，寿命最长 600s）
     DispatchQueue.main.async { permissionCards.noteStdinClosed() }

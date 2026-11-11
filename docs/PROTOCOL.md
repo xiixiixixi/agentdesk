@@ -118,7 +118,7 @@ service 端 `ab_login` 的完整流程（防钓鱼双锁见 README 安全模型�
 
 | 层 | 执行体 | 能力 |
 |---|---|---|
-| A | `host/cua-helper`（`swift/cua-helper.swift` 由 setup 用 swiftc 编译；未编译产物不入库） | windows（CGWindowList）/ ax-tree（AXUIElement 遍历，深度 12、每层 80、总 1500、文本截断 120）/ element-click（AXPress 优先，失败取元素 bounds 中心定向坐标兜底）/ xy-click（有 pid → 定向投递不动真实光标；无 pid → 全局）/ type（≤4000 字符，20 字符/事件分段）/ key（键码映射 + cmd/ctrl/alt/shift）/ app-focus（AX raise + activate）/ overlay-show · overlay-hide（幽魂光标叠加）/ request-permissions（系统标准权限申请）/ show-permission-card · hide-permission-card（权限引导悬浮卡片，v0.5.4） |
+| A | `host/cua-helper`（`swift/cua-helper.swift` 由 setup 用 swiftc 编译；未编译产物不入库） | windows（CGWindowList）/ ax-tree（AXUIElement 遍历，深度 12、每层 80、总 1500、文本截断 120）/ element-click（AXPress 优先，失败取元素 bounds 中心定向坐标兜底）/ set-value（AXValue 写入 + 回读校验）/ perform-action（校验并执行 AXActionNames）/ select-text（AXSelectedTextRange）/ scroll（优先 AX 滚动条 value，回退定向滚轮）/ drag（定向拖拽）/ xy-click（v1.1.0：有 pid → 合成激活 + 带窗口归属的定向事件，目标以为自己在前台但真实前台与光标不动；同一应用内非 key 窗口先 AX 设为应用内 main；无 pid → 全局；给 pid 但点击点无目标窗口 → no-window-at-point，不盲点）/ type（≤4000 字符，20 字符/事件分段；键盘动作短暂真激活目标后恢复原前台）/ key（键码映射 + cmd/ctrl/alt/shift；同样真激活后恢复）/ paste（剪贴板 + ⌘V；真激活后恢复）/ app-focus（先撤销合成激活，再 AX raise + activate）/ release-focus（撤销合成激活）/ PiP（常驻控制指示器：ScreenCaptureKit 实时窗口视频 ~15fps，失败回退截图；非激活/点击穿透）/ overlay-show · overlay-hide（幽魂光标叠加）/ request-permissions（系统标准权限申请）/ show-permission-card · hide-permission-card（权限引导悬浮卡片，v0.5.4） |
 | B | osascript + System Events（零编译兜底） | 同形状的 ax-tree / element-click / type / key / app-focus / windows（较慢；无坐标能力；窗口无 CGWindowID，截图用 rect） |
 | C | 无任何授权 | windows（仅 helper 编译过时走 CGWindowList，窗口表本身无需授权）+ 截图（screencapture，需屏幕录制授权） |
 
@@ -152,6 +152,9 @@ service 端 `ab_login` 的完整流程（防钓鱼双锁见 README 安全模型�
 
 `cua_status`（能力矩阵+人话授权指引 `permissionGuide:{text,card}`，card=有无悬浮引导卡片能力）/ `cua_windows` / `cua_ax_tree {app?|pid?, maxDepth?}` /
 `cua_screenshot {windowId?|rect?, format?}` / `cua_click {app?|pid?, role?, title?} | {x, y, pid?}` /
+`cua_set_value {app?|pid?, role, title?, value}` / `cua_action {app?|pid?, role, title?, action}` /
+`cua_select_text {app?|pid?, role, title?, text, prefix?, suffix?, selection?}` / `cua_paste {app?|pid?, text, format?}` /
+`cua_scroll {app?|pid?, x?, y?, role?, title?, direction?, pages?, scrollX?, scrollY?}` / `cua_drag {app?|pid?, fromX, fromY, toX, toY, steps?, durationMs?}` /
 `cua_type {text, app?|pid?}` / `cua_key {key, modifiers?, confirmationToken?}` / `cua_app_focus {app}` /
 `cua_verify {x?|y?|windowId?}`。
 
@@ -164,7 +167,7 @@ service 端 `ab_login` 的完整流程（防钓鱼双锁见 README 安全模型�
 
 ### 审计与策略
 
-- 审计：`audit.recordCua` 写 `cua_click` / `cua_type` / `cua_key` / `cua_app_focus` 四类条目
+- 审计：`audit.recordCua` 写 `cua_click` / `cua_set_value` / `cua_action` / `cua_select_text` / `cua_paste` / `cua_scroll` / `cua_drag` / `cua_type` / `cua_key` / `cua_app_focus` 十类条目
   （读类不入档）；xy 点击记坐标，type 记 `[redacted]` + 长度，key 记键名与修饰键。
 - 策略：policy kind `cua_action`——默认 `cua_key` 的 `cmd+q` / `cmd+w`（`confirmCuaKeys` 可配）
   走确认门（`POLICY_BLOCKED` + 一次性 token，`ab_confirm` 批准后带 `confirmationToken` 重试），
@@ -197,5 +200,12 @@ stdin 由后台队列逐行读，窗口操作经主队列执行，stdin EOF → 
 
 锁屏/解锁/绕过认证类能力（helper 二进制中不存在对应命令）。
 无 pid 的全局坐标点击会移动真实光标——工具描述如实声明，这是唯一会动用户光标的操作
-（幽魂光标是叠加窗可视化，点击穿透、不动真鼠标、不抢焦点）。
+（幽魂光标是叠加窗可视化，点击穿透、不动真鼠标、不抢焦点）。给 pid 但点击点没有目标窗口
+（别的桌面/已最小化）会报 `no-window-at-point`，不会盲点当前前台应用。
+合成激活（v1.1.0）不是真实前台切换：只向目标 pid 投递 AppKitDefined/ApplicationActivated，
+真实前台应用与真实光标都不变；最后一次动作 5 秒后、`release-focus`、`app-focus` 或进程退出时
+自动投递 ApplicationDeactivated 收尾。
+键盘/粘贴是例外：本机实测后台合成激活无法可靠接收键盘事件（Codex 用私有 `SAIVirtualKeyPress`），
+因此 v1.1.3 起 `type` / `key` / `paste` 会短暂真激活目标应用（窗口设为 main）、发完后恢复原前台；
+回执带 `realFocus:true`。鼠标点击、AX 写值/次级动作、AX 滚动仍不抢前台。
 

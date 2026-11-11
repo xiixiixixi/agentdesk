@@ -11,9 +11,10 @@
 // 三层执行体（tier）：
 //   A（编译版，最强）：host/cua-helper（swift/cua-helper.swift 由 setup 用 swiftc 编译，
 //     行协议 JSON）。windows=CGWindowList、AX 遍历、element-click（AXPress+坐标兜底）、
-//     xy-click（v0.5.5：进程定向鼠标注入在新系统不生效——有 pid 时先带前台再全局注入，
-//     回 fallback:'global'；无 pid 全局）、type（UTF-16 直塞，中文/emoji 可靠）、
-//     key（真实修饰键序列）、app-focus。
+//     xy-click（v1.1.0：有 pid 时「合成激活 + 带窗口归属的定向事件」——目标应用以为自己
+//     在前台，真实前台与光标不动；无 pid 才全局兜底，给 pid 但点击点没有目标窗口会报
+//     no-window-at-point，绝不盲点前台）、set-value（AXValue 写入）、perform-action（次级
+//     AX 动作）、type（UTF-16 直塞，中文/emoji 可靠）、key（真实修饰键序列）、app-focus。
 //   B（零编译兜底）：osascript + System Events——ax-tree / element-click / type / key /
 //     app-focus / windows 全走 AppleScript（较慢；无 xy 定向能力）。
 //   C（无任何授权）：仅 windows（helper 编译过时走 CGWindowList，无需授权）与截图
@@ -318,7 +319,8 @@ export function compileHelper({ log = () => {}, out } = {}) {
       const sdk = sdkRoot();
       if (sdk) env.SDKROOT = sdk;
     }
-    const r = spawnSync(swiftc, ['-O', SWIFT_SRC_PATH, '-o', outPath], { encoding: 'utf8', timeout: 300_000, env });
+    // ScreenCaptureKit 弱链接：旧版 macOS 仍能启动 helper（实时 PiP 自动跳过/回退截图）。
+    const r = spawnSync(swiftc, ['-O', '-Xlinker', '-weak_framework', '-Xlinker', 'ScreenCaptureKit', SWIFT_SRC_PATH, '-o', outPath], { encoding: 'utf8', timeout: 300_000, env });
     if (r.status !== 0) {
       return { compiled: false, swiftc: true, path: outPath, reason: `swiftc 退出码 ${r.status}: ${(r.stderr || '').slice(0, 400)}` };
     }
@@ -992,7 +994,8 @@ export function createCua(opts = {}) {
       const r = await h.request('xy-click', { x, y, ...(pid ? { pid } : {}) });
       return {
         ok: true, mode: 'xy', x, y, targeted: r.targeted === true,
-        ...(r.fallback ? { fallback: r.fallback } : {}), // v0.5.5：定向鼠标降级全局时如实回执
+        ...(r.syntheticFocus ? { syntheticFocus: true } : {}), // v1.1.0：目标被合成激活（真实前台/光标未动）
+        ...(r.fallback ? { fallback: r.fallback } : {}), // 无 pid 时降级全局（会动真实光标）
         ...(r.focusedFirst ? { focusedFirst: true } : {}),
         ...(r.coveredBy ? { coveredBy: r.coveredBy } : {}), // 点击点曾被其他应用窗口遮挡（已代为置前）
         ...(r.windowId ? { windowId: r.windowId } : {}),
@@ -1024,6 +1027,8 @@ export function createCua(opts = {}) {
       return {
         ok: true, mode: 'element', pid: targetPid, role,
         ...(r.pressed ? { pressed: true } : { xyFallback: true, bounds: r.bounds, at: r.at }),
+        ...(r.targeted ? { targeted: true } : {}), // 坐标兜底的定向投递（不抢前台、不动真实光标）
+        ...(r.syntheticFocus ? { syntheticFocus: true } : {}),
         ...(r.fallback ? { fallback: r.fallback } : {}), // 坐标兜底同样可能全局降级
         ...(r.focusedFirst ? { focusedFirst: true } : {}),
         ...(r.coveredBy ? { coveredBy: r.coveredBy } : {}),
@@ -1032,6 +1037,169 @@ export function createCua(opts = {}) {
     }
     await osa(execRunner, osaElementClickScript(targetPid, role, title ?? ''));
     return { ok: true, mode: 'element', pid: targetPid, role, pressed: true, via: 'osascript' };
+  }
+
+  /**
+   * AX 写值：{app?|pid, role, title?, value}。仅 A 层；不移动鼠标、不抢前台。
+   * 值脱敏入审计（只记长度与 [redacted]）。
+   */
+  async function setValue({ app, pid, role, title, value } = {}) {
+    requireMac();
+    await requireCap('elementClick');
+    if (!role) throw new CuaError('set_value 需要 role（配合 title，来自 cua_ax_tree）', 'BAD_ARGS');
+    if (typeof value !== 'string' || value.length === 0) throw new CuaError('set_value 需要非空 value', 'BAD_ARGS');
+    if (value.length > TYPE_MAX_CHARS) throw new CuaError(`value 过长（>${TYPE_MAX_CHARS} 字符），请分段写入`, 'TEXT_TOO_LONG');
+    const targetPid = await resolvePid({ pid, app });
+    const h = helper();
+    if (!h) throw new CuaError('set_value 需要 A 层助手 host/cua-helper（npm run setup 编译）', 'CAPABILITY_UNAVAILABLE');
+    const beforeTarget = await evidenceTargetForPid(targetPid);
+    const before = await snapshotEvidence(beforeTarget);
+    audit?.recordCua({ tool: 'setValue', pid: targetPid, role, title, text: value });
+    recordAction({ tool: 'cua_set_value', pid: targetPid, role, title }, before);
+    const r = await h.request('set-value', { pid: targetPid, role, ...(title ? { title } : {}), value });
+    return {
+      ok: true, mode: 'set-value', pid: targetPid, role,
+      ...(title ? { title } : {}),
+      valueLength: value.length,
+      verified: r.verified === true, // 回读一致=false 不代表写入失败（部分控件读回格式不同）
+    };
+  }
+
+  /** AX 次级动作：{app?|pid, role, title?, action}。仅 A 层；动作名来自 cua_ax_tree 的 actions。 */
+  async function performAction({ app, pid, role, title, action } = {}) {
+    requireMac();
+    await requireCap('elementClick');
+    if (!role) throw new CuaError('action 需要 role（配合 title，来自 cua_ax_tree）', 'BAD_ARGS');
+    if (typeof action !== 'string' || !action.trim()) throw new CuaError('action 需要动作名（来自 cua_ax_tree 的 actions）', 'BAD_ARGS');
+    const targetPid = await resolvePid({ pid, app });
+    const h = helper();
+    if (!h) throw new CuaError('action 需要 A 层助手 host/cua-helper（npm run setup 编译）', 'CAPABILITY_UNAVAILABLE');
+    const beforeTarget = await evidenceTargetForPid(targetPid);
+    const before = await snapshotEvidence(beforeTarget);
+    audit?.recordCua({ tool: 'performAction', pid: targetPid, role, title, mode: action.trim() });
+    recordAction({ tool: 'cua_action', pid: targetPid, role, title, action }, before);
+    const r = await h.request('perform-action', { pid: targetPid, role, ...(title ? { title } : {}), action });
+    return {
+      ok: true, mode: 'action', pid: targetPid, role,
+      ...(title ? { title } : {}),
+      action: r.action ?? action,
+      availableActions: Array.isArray(r.availableActions) ? r.availableActions : [],
+    };
+  }
+
+  /** 在可编辑元素里选中匹配文本（AXSelectedTextRange）；text 脱敏入审计。 */
+  async function selectText({ app, pid, role, title, text, prefix, suffix, selection } = {}) {
+    requireMac();
+    await requireCap('elementClick');
+    if (!role) throw new CuaError('select_text 需要 role（配合 title，来自 cua_ax_tree）', 'BAD_ARGS');
+    if (typeof text !== 'string' || !text.length) throw new CuaError('select_text 需要非空 text', 'BAD_ARGS');
+    const sel = selection ?? 'text';
+    if (!['text', 'cursor_before', 'cursor_after'].includes(sel)) {
+      throw new CuaError('selection 需为 text / cursor_before / cursor_after', 'BAD_ARGS');
+    }
+    const targetPid = await resolvePid({ pid, app });
+    const h = helper();
+    if (!h) throw new CuaError('select_text 需要 A 层助手 host/cua-helper（npm run setup 编译）', 'CAPABILITY_UNAVAILABLE');
+    const beforeTarget = await evidenceTargetForPid(targetPid);
+    const before = await snapshotEvidence(beforeTarget);
+    audit?.recordCua({ tool: 'selectText', pid: targetPid, role, title, text });
+    recordAction({ tool: 'cua_select_text', pid: targetPid, role, title, textLength: text.length }, before);
+    const r = await h.request('select-text', {
+      pid: targetPid, role, ...(title ? { title } : {}), text,
+      ...(prefix ? { prefix } : {}), ...(suffix ? { suffix } : {}), selection: sel,
+    });
+    return {
+      ok: true, mode: 'select-text', pid: targetPid, role,
+      ...(title ? { title } : {}), selection: sel,
+      verified: r.verified === true, range: r.range, textLength: text.length,
+    };
+  }
+
+  /** 剪贴板 + ⌘V 粘贴（完成后恢复原剪贴板）；text 脱敏入审计。 */
+  async function paste({ app, pid, text, format = 'text' } = {}) {
+    requireMac();
+    await requireCap('type');
+    if (typeof text !== 'string' || !text.length) throw new CuaError('paste 需要非空 text', 'BAD_ARGS');
+    if (text.length > TYPE_MAX_CHARS) throw new CuaError(`text 过长（>${TYPE_MAX_CHARS} 字符），请分段粘贴`, 'TEXT_TOO_LONG');
+    if (!['text', 'md', 'html'].includes(format)) throw new CuaError('format 需为 text / md / html', 'BAD_ARGS');
+    const targetPid = await resolvePid({ pid, app });
+    const h = helper();
+    if (!h) throw new CuaError('paste 需要 A 层助手 host/cua-helper（npm run setup 编译）', 'CAPABILITY_UNAVAILABLE');
+    const beforeTarget = await evidenceTargetForPid(targetPid);
+    const before = await snapshotEvidence(beforeTarget);
+    audit?.recordCua({ tool: 'paste', pid: targetPid, text });
+    recordAction({ tool: 'cua_paste', pid: targetPid, chars: text.length, format }, before);
+    const r = await h.request('paste', { pid: targetPid, text, format });
+    return {
+      ok: true, mode: 'paste', pid: targetPid,
+      chars: r.chars ?? text.length, format,
+      clipboardRestored: r.clipboardRestored === true,
+      ...(r.realFocus ? { realFocus: true, note: '粘贴前真激活了目标应用，完成后已恢复原前台' } : {}),
+    };
+  }
+
+  /** 定向滚轮：坐标/元素中心/窗口中心；direction 或 scrollX/scrollY。 */
+  async function scroll({ app, pid, x, y, role, title, direction, pages, scrollX, scrollY } = {}) {
+    requireMac();
+    await requireCap('xyClick');
+    const hasXY = Number.isFinite(x) && Number.isFinite(y);
+    if ((x !== undefined || y !== undefined) && !hasXY) throw new CuaError('scroll 的 x/y 需同时给数字', 'BAD_ARGS');
+    const hasDir = typeof direction === 'string' && direction.length > 0;
+    const hasDelta = Number.isFinite(scrollX) || Number.isFinite(scrollY);
+    if (!hasDir && !hasDelta) throw new CuaError('scroll 需要 direction 或 scrollX/scrollY', 'BAD_ARGS');
+    if (hasDir && !['up', 'down', 'left', 'right'].includes(direction.toLowerCase())) {
+      throw new CuaError('direction 需为 up / down / left / right', 'BAD_ARGS');
+    }
+    const p = pages ?? 1;
+    if (!Number.isInteger(p) || p < 1 || p > 10) throw new CuaError('pages 需为 1..10 的整数', 'BAD_ARGS');
+    const targetPid = await resolvePid({ pid, app });
+    const h = helper();
+    if (!h) throw new CuaError('scroll 需要 A 层助手 host/cua-helper（npm run setup 编译）', 'CAPABILITY_UNAVAILABLE');
+    const beforeTarget = await evidenceTargetForPid(targetPid);
+    const before = await snapshotEvidence(beforeTarget);
+    audit?.recordCua({ tool: 'scroll', pid: targetPid, role, title, x: hasXY ? x : undefined, y: hasXY ? y : undefined, key: hasDir ? direction.toLowerCase() : 'delta' });
+    recordAction({ tool: 'cua_scroll', pid: targetPid, role, title, direction: hasDir ? direction.toLowerCase() : 'delta' }, before);
+    const r = await h.request('scroll', {
+      pid: targetPid,
+      ...(hasXY ? { x, y } : {}),
+      ...(role ? { role } : {}), ...(title ? { title } : {}),
+      ...(hasDir ? { direction: direction.toLowerCase(), pages: p } : {}),
+      ...(hasDelta ? { scrollX: Number.isFinite(scrollX) ? Math.trunc(scrollX) : 0, scrollY: Number.isFinite(scrollY) ? Math.trunc(scrollY) : 0 } : {}),
+    });
+    return {
+      ok: true, mode: 'scroll', pid: targetPid,
+      dx: r.dx ?? 0, dy: r.dy ?? 0, steps: r.steps ?? 1,
+      via: r.via ?? 'event', ...(r.bar ? { bar: r.bar } : {}), ...(r.value !== undefined ? { value: r.value } : {}),
+      ...(r.verified !== undefined ? { verified: r.verified } : {}), ...(r.pages ? { pages: r.pages } : {}),
+      windowId: r.windowId, targeted: r.targeted === true, syntheticFocus: r.syntheticFocus === true,
+    };
+  }
+
+  /** 定向拖拽：按下 → 插值拖动 → 释放；起点窗口决定 windowNumber。 */
+  async function drag({ app, pid, fromX, fromY, toX, toY, steps, durationMs } = {}) {
+    requireMac();
+    await requireCap('xyClick');
+    for (const [name, v] of [['fromX', fromX], ['fromY', fromY], ['toX', toX], ['toY', toY]]) {
+      if (!Number.isFinite(v)) throw new CuaError(`drag 的 ${name} 需为数字`, 'BAD_ARGS');
+    }
+    const s = steps ?? 12;
+    if (!Number.isInteger(s) || s < 2 || s > 60) throw new CuaError('steps 需为 2..60 的整数', 'BAD_ARGS');
+    const d = durationMs ?? 300;
+    if (!Number.isInteger(d) || d < 30 || d > 2000) throw new CuaError('durationMs 需为 30..2000 的整数', 'BAD_ARGS');
+    const targetPid = await resolvePid({ pid, app });
+    const h = helper();
+    if (!h) throw new CuaError('drag 需要 A 层助手 host/cua-helper（npm run setup 编译）', 'CAPABILITY_UNAVAILABLE');
+    const beforeTarget = await evidenceTargetForPid(targetPid);
+    const before = await snapshotEvidence(beforeTarget);
+    audit?.recordCua({ tool: 'drag', pid: targetPid, x: fromX, y: fromY });
+    recordAction({ tool: 'cua_drag', pid: targetPid, from: [fromX, fromY], to: [toX, toY] }, before);
+    const r = await h.request('drag', { pid: targetPid, fromX, fromY, toX, toY, steps: s, durationMs: d });
+    return {
+      ok: true, mode: 'drag', pid: targetPid,
+      from: { x: fromX, y: fromY }, to: { x: toX, y: toY },
+      steps: r.steps ?? s, windowId: r.windowId,
+      targeted: r.targeted === true, syntheticFocus: r.syntheticFocus === true,
+    };
   }
 
   /** 输入文本（进前台/目标应用；A 层可定向 pid）。text 脱敏入审计。 */
@@ -1049,7 +1217,10 @@ export function createCua(opts = {}) {
     const h = helper();
     if (h) {
       const r = await h.request('type', { text, ...(targetPid ? { pid: targetPid } : {}) });
-      return { ok: true, chars: r.chars ?? text.length, ...(targetPid ? { pid: targetPid } : {}) };
+      return {
+        ok: true, chars: r.chars ?? text.length, ...(targetPid ? { pid: targetPid } : {}),
+        ...(r.realFocus ? { realFocus: true, note: '键盘动作前真激活了目标应用，完成后已恢复原前台' } : {}),
+      };
     }
     await osa(execRunner, osaTypeScript(text, app ?? null));
     return { ok: true, chars: text.length, via: 'osascript' };
@@ -1088,7 +1259,10 @@ export function createCua(opts = {}) {
     const h = helper();
     if (h) {
       const r = await h.request('key', { key: lowered, modifiers: mods, ...(targetPid ? { pid: targetPid } : {}) });
-      return { ok: true, key: lowered, keyCode: r.keyCode, ...(mods.length ? { modifiers: mods } : {}), ...(targetPid ? { pid: targetPid } : {}) };
+      return {
+        ok: true, key: lowered, keyCode: r.keyCode, ...(mods.length ? { modifiers: mods } : {}), ...(targetPid ? { pid: targetPid } : {}),
+        ...(r.realFocus ? { realFocus: true, note: '按键前真激活了目标应用，完成后已恢复原前台' } : {}),
+      };
     }
     await osa(execRunner, osaKeyScript(KEY_CODES[lowered], mods, app ?? null));
     return { ok: true, key: lowered, ...(mods.length ? { modifiers: mods } : {}), via: 'osascript' };
@@ -1162,6 +1336,12 @@ export function createCua(opts = {}) {
     axTree,
     screenshot,
     click,
+    setValue,
+    performAction,
+    selectText,
+    paste,
+    scroll,
+    drag,
     type,
     key,
     appFocus,
@@ -1172,7 +1352,7 @@ export function createCua(opts = {}) {
   };
 }
 
-// ---------- MCP 工具注册（9 个 cua_* 工具；文本结果风格与 mcp.mjs 一致） ----------
+// ---------- MCP 工具注册（15 个 cua_* 工具；文本结果风格与 mcp.mjs 一致） ----------
 
 function textResult(payload, isError = false) {
   const text = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
@@ -1198,7 +1378,7 @@ export function registerCuaTools(server, { cua }) {
 
   server.registerTool('cua_status', {
     title: '屏幕操作能力体检',
-    description: '探测屏幕操作（CUA）当前能力层并给授权指引。返回 {tier, axGranted, screenGranted, responsibleProcess, helperApp, permissionGuide, helperCompiled, swiftcAvailable, overlay, capabilities, guidance}：tier A=编译版助手（最强，坐标可定向投递）/ B=osascript 兜底（无坐标点击）/ C=无授权（仅窗口清单与截图）/ unsupported=非 macOS；responsibleProcess=系统设置里要勾选的名字；helperApp 非 null 时权限主体是 ~/.agentdesk/CUA Helper.app（引导用户把该 .app 拖进设置列表即完成授权，终端是谁无关）；permissionGuide=人话授权指引（{text, card}：text=两步说明，card=有无悬浮引导卡片）；overlay={available, enabled} 报告幽魂光标叠加（AI 动手位置的琥珀色提示，policy-defaults.json 的 cuaOverlay 可关）。缺权限时首次使用会自动引导授权：npm run cua-selftest（互动引导，拖完卡片自动检测）或 npm run setup（非交互）。首次使用 cua_* 前先跑这个。',
+    description: '探测屏幕操作（CUA）当前能力层并给授权指引。返回 {tier, axGranted, screenGranted, responsibleProcess, helperApp, permissionGuide, helperCompiled, swiftcAvailable, overlay, capabilities, guidance}：tier A=编译版助手（最强，坐标可定向投递）/ B=osascript 兜底（无坐标点击）/ C=无授权（仅窗口清单与截图）/ unsupported=非 macOS；responsibleProcess=系统设置里要勾选的名字；helperApp 非 null 时权限主体是 ~/.agentdesk/AgentDesk.app（引导用户把该 .app 拖进设置列表即完成授权，终端是谁无关）；permissionGuide=人话授权指引（{text, card}：text=两步说明，card=有无悬浮引导卡片）；overlay={available, enabled} 报告幽魂光标叠加（AI 动手位置的琥珀色提示，policy-defaults.json 的 cuaOverlay 可关）。缺权限时首次使用会自动引导授权：npm run cua-selftest（互动引导，拖完卡片自动检测）或 npm run setup（非交互）。首次使用 cua_* 前先跑这个。',
     inputSchema: {},
   }, guard(async () => textResult(await cua.status())));
 
@@ -1238,10 +1418,10 @@ export function registerCuaTools(server, { cua }) {
 
   server.registerTool('cua_click', {
     title: '点击（元素优先，坐标兜底）',
-    description: '两种模式：① 元素 {app|pid, role, title?}——AX 元素动作优先（语义正确），A 层失败自动取元素中心坐标兜底；role/title 来自 cua_ax_tree，title 按「可读标签」匹配：标题命不中依次核对描述与值（Finder 侧栏即靠此命中）。② 坐标 {x, y, pid?}——仅 A 层；给 pid 时若目标不前台会先把目标带到前台，再全局注入（进程定向鼠标注入在现代 macOS 已不生效，结果里 fallback:"global" 如实标注；会移动真实光标）；不给 pid 直接全局注入（同样会移动真实光标，慎用）。动作会自动留「前证据」，配合 cua_verify 物理验证；点击位置闪现幽魂光标提示（叠加窗，policy 的 cuaOverlay 可关）。全审计。',
+    description: '两种模式：① 元素 {app|pid, role, title?}——AX 元素动作优先（语义正确），A 层失败自动取元素中心坐标兜底；role/title 来自 cua_ax_tree，title 按「可读标签」匹配：标题命不中依次核对描述与值（Finder 侧栏即靠此命中）。② 坐标 {x, y, pid?}——仅 A 层；给 pid 时走「合成激活 + 定向投递」：目标应用会以为自己在前台（真实前台不变、真实光标不动），点击事件带窗口归属落到目标窗口，不抢焦点；无 pid 才全局注入（会移动真实光标，结果里 fallback:"global" 如实标注）；给 pid 但点击点没有目标窗口会报 no-window-at-point（不会误点前台应用）。动作会自动留「前证据」，配合 cua_verify 物理验证；点击位置闪现幽魂光标提示（叠加窗，policy 的 cuaOverlay 可关）。全审计。',
     inputSchema: {
       app: z.string().optional().describe('元素模式：目标应用名'),
-      pid: z.number().int().optional().describe('目标进程 id（元素/坐标模式均可；坐标模式带 pid=目标置前+全局注入，见工具描述）'),
+      pid: z.number().int().optional().describe('目标进程 id（元素/坐标模式均可；坐标模式带 pid=合成激活+定向投递，不抢前台、不动真实光标，见工具描述）'),
       role: z.string().optional().describe('元素模式：AX 角色（如 AXButton）'),
       title: z.string().optional().describe('元素模式：元素标题（精确匹配，同角色多个时用它区分）'),
       x: z.number().optional().describe('坐标模式：屏幕 x（像素）'),
@@ -1249,9 +1429,91 @@ export function registerCuaTools(server, { cua }) {
     },
   }, guard(async (args) => textResult(await cua.click(args))));
 
+  server.registerTool('cua_set_value', {
+    title: '设置元素值（AX 写值）',
+    description: '把可编辑元素的 AXValue 直接替换为 value——不移动鼠标、不抢前台、不输入按键。元素用 role/title 定位（来自 cua_ax_tree）；元素必须可写，否则返回 value-not-settable。≤4000 字符；值脱敏入审计（[redacted] + 长度）。动作会自动留「前证据」，配合 cua_verify 验证。仅 A 层（编译版 helper + 辅助功能授权）。',
+    inputSchema: {
+      app: z.string().optional().describe('目标应用名（可选）'),
+      pid: z.number().int().optional().describe('目标进程 id（优先于 app）'),
+      role: z.string().min(1).describe('元素 AX 角色（如 AXTextField，来自 cua_ax_tree）'),
+      title: z.string().optional().describe('元素标题/可读标签（同角色多个时区分）'),
+      value: z.string().min(1).describe('要写入的值（≤4000 字符；值脱敏入审计）'),
+    },
+  }, guard(async (args) => textResult(await cua.setValue(args))));
+
+  server.registerTool('cua_action', {
+    title: '执行元素次级动作',
+    description: '执行元素暴露的次级无障碍动作（Raise / Expand / Collapse / Show Menu / Scroll Up…；来自 cua_ax_tree 的 actions）。动作名大小写不敏感；元素不支持时返回 action-not-available 与可用动作列表。不移动鼠标、不抢前台。动作会自动留「前证据」，配合 cua_verify 验证。仅 A 层。',
+    inputSchema: {
+      app: z.string().optional().describe('目标应用名（可选）'),
+      pid: z.number().int().optional().describe('目标进程 id（优先于 app）'),
+      role: z.string().min(1).describe('元素 AX 角色（来自 cua_ax_tree）'),
+      title: z.string().optional().describe('元素标题/可读标签（同角色多个时区分）'),
+      action: z.string().min(1).describe('动作名（来自 cua_ax_tree 的 actions，大小写不敏感）'),
+    },
+  }, guard(async (args) => textResult(await cua.performAction(args))));
+
+  server.registerTool('cua_select_text', {
+    title: '选中元素文本',
+    description: '在可编辑元素的 AXValue 文本里定位 text，并用 AXSelectedTextRange 选中它（或把光标放到匹配文本前/后，selection=text|cursor_before|cursor_after）。prefix/suffix 用于消歧；写后回读校验 verified。不移动鼠标、不抢前台。text 脱敏入审计。仅 A 层。',
+    inputSchema: {
+      app: z.string().optional().describe('目标应用名（可选）'),
+      pid: z.number().int().optional().describe('目标进程 id（优先于 app）'),
+      role: z.string().min(1).describe('元素 AX 角色（如 AXTextField / AXTextArea，来自 cua_ax_tree）'),
+      title: z.string().optional().describe('元素标题/可读标签（同角色多个时区分）'),
+      text: z.string().min(1).describe('要选中的文本（≤4000 字符；值脱敏入审计）'),
+      prefix: z.string().optional().describe('目标文本前面的上下文（消歧）'),
+      suffix: z.string().optional().describe('目标文本后面的上下文（消歧）'),
+      selection: z.enum(['text', 'cursor_before', 'cursor_after']).optional().describe('选中文本本身 / 光标放到前面 / 光标放到后面（默认 text）'),
+    },
+  }, guard(async (args) => textResult(await cua.selectText(args))));
+
+  server.registerTool('cua_paste', {
+    title: '粘贴文本（剪贴板 + ⌘V）',
+    description: '把 text 写入剪贴板并定向 ⌘V 粘贴到目标应用，完成后恢复原剪贴板（format=text|md|html）。中文/多行/富文本比逐字输入更稳；A 层会短暂真激活目标应用（完成后恢复原前台），目标需先有焦点（可先 cua_click）。≤4000 字符；值脱敏入审计。仅 A 层。',
+    inputSchema: {
+      app: z.string().optional().describe('目标应用名（可选）'),
+      pid: z.number().int().optional().describe('目标进程 id（优先于 app）'),
+      text: z.string().min(1).describe('要粘贴的文本（≤4000 字符；值脱敏入审计）'),
+      format: z.enum(['text', 'md', 'html']).optional().describe('内容格式（默认 text；md 按纯文本写剪贴板，html 同时写 HTML 类型）'),
+    },
+  }, guard(async (args) => textResult(await cua.paste(args))));
+
+  server.registerTool('cua_scroll', {
+    title: '定向滚动',
+    description: '定向滚动：优先在落点下找 AXScrollArea，改对应滚动条的 AXValue（后台可用、不抢前台）；不支持时回退定向滚轮事件。方向滚动用 direction=up/down/left/right + pages(1..10)；像素增量用 scrollX/scrollY。',
+    inputSchema: {
+      app: z.string().optional().describe('目标应用名（可选）'),
+      pid: z.number().int().optional().describe('目标进程 id（优先于 app）'),
+      x: z.number().optional().describe('滚动位置：屏幕 x（与 y 同时给）'),
+      y: z.number().optional().describe('滚动位置：屏幕 y（与 x 同时给）'),
+      role: z.string().optional().describe('元素 AX 角色（给 role 时在该元素中心滚动）'),
+      title: z.string().optional().describe('元素标题/可读标签（配合 role）'),
+      direction: z.enum(['up', 'down', 'left', 'right']).optional().describe('滚动方向（与 pages 配对；不要和 scrollX/scrollY 同时用）'),
+      pages: z.number().int().optional().describe('页数 1..10（默认 1，每页约 400px）'),
+      scrollX: z.number().optional().describe('水平像素增量（负数向左；与 direction 二选一）'),
+      scrollY: z.number().optional().describe('垂直像素增量（负数向上；与 direction 二选一）'),
+    },
+  }, guard(async (args) => textResult(await cua.scroll(args))));
+
+  server.registerTool('cua_drag', {
+    title: '定向拖拽',
+    description: '定向拖拽：从屏幕坐标 fromX/fromY 按下，按 steps 插值拖到 toX/toY 后释放；durationMs 控制总时长。不移动真实光标、不抢前台。',
+    inputSchema: {
+      app: z.string().optional().describe('目标应用名（可选）'),
+      pid: z.number().int().optional().describe('目标进程 id（优先于 app）'),
+      fromX: z.number().describe('起点屏幕 x'),
+      fromY: z.number().describe('起点屏幕 y'),
+      toX: z.number().describe('终点屏幕 x'),
+      toY: z.number().describe('终点屏幕 y'),
+      steps: z.number().int().optional().describe('拖动步数 2..60（默认 12）'),
+      durationMs: z.number().int().optional().describe('总时长 30..2000ms（默认 300）'),
+    },
+  }, guard(async (args) => textResult(await cua.drag(args))));
+
   server.registerTool('cua_type', {
     title: '输入文本',
-    description: '向目标应用输入文本（给 app/pid 时 A 层定向投递、B 层先置前台；都不给=当前前台应用）。中文/emoji 等 Unicode 文本经 UTF-16 直塞事件，稳定可靠（不受输入法干扰）。≤4000 字符。值脱敏入审计（记 [redacted] 与长度）。',
+    description: '向目标应用输入文本（给 app/pid 时 A 层会短暂真激活目标应用、完成后恢复原前台，再定向输入——本机实测后台合成激活无法可靠接收键盘事件；B 层先置前台；都不给=当前前台应用）。中文/emoji 等 Unicode 文本经 UTF-16 直塞事件，稳定可靠（不受输入法干扰）。≤4000 字符。值脱敏入审计（记 [redacted] 与长度）。',
     inputSchema: {
       text: z.string().min(1).describe('要输入的文本（≤4000 字符，更长请分段）'),
       app: z.string().optional().describe('目标应用名（可选）'),
@@ -1261,7 +1523,7 @@ export function registerCuaTools(server, { cua }) {
 
   server.registerTool('cua_key', {
     title: '按键/组合键（危险键需确认）',
-    description: '按一个键或组合键（key=键名，modifiers=[cmd|ctrl|alt|shift]）。默认 cmd+q（退程序）/ cmd+w（关窗）需人工确认：首次返回 {needConfirmation,token}，ab_confirm 批准后带 confirmationToken 重试（名单可在 policy-defaults.json 的 confirmCuaKeys 配置）。给 app/pid 时 A 层定向投递。',
+    description: '按一个键或组合键（key=键名，modifiers=[cmd|ctrl|alt|shift]）。默认 cmd+q（退程序）/ cmd+w（关窗）需人工确认：首次返回 {needConfirmation,token}，ab_confirm 批准后带 confirmationToken 重试（名单可在 policy-defaults.json 的 confirmCuaKeys 配置）。给 app/pid 时 A 层会短暂真激活目标应用、完成后恢复原前台，再定向按键（本机实测后台合成激活无法可靠接收键盘）。',
     inputSchema: {
       key: z.string().min(1).describe('键名：字母/数字/enter/tab/escape/space/delete/up/down/left/right/home/end/pageup/pagedown/f1-f12'),
       modifiers: z.array(z.enum(['cmd', 'ctrl', 'alt', 'shift', 'command', 'control', 'option'])).optional().describe('修饰键'),

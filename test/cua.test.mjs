@@ -7,7 +7,7 @@
 //   - 审计记录（cua_type 脱敏 [redacted]；xy 点击记坐标；按 cmd 查询）
 //   - 确认门（cua_key cmd+q 拦截 → ab_confirm 批准 → 带 token 放行；普通键直行）
 //   - cua_verify 证据组装（动作前证据 + 验证时后证据 + 防幻觉说明）
-//   - MCP 工具族（9 个 cua_* 注册；cua_status / cua_screenshot / cua_key 经 InMemoryTransport）
+//   - MCP 工具族（15 个 cua_* 注册；cua_status / cua_screenshot / cua_key 经 InMemoryTransport）
 //   - 幽魂光标（v0.5.1）：overlay-show 拼装/窗口中心近似/xyFallback 落点精化；失败不阻塞动作；
 //     cuaOverlay 开关（false 零调用）；type/key 30s 提示窗口（假时钟）；叠加不入审计、不污染前证据
 //   - 授权引导（v0.5.3 起；v1.0.0 拖 .app + 自动检测）：requestPermissions 协议拼装/解析
@@ -55,6 +55,7 @@ import {
 
 const CUA_TOOLS = [
   'cua_status', 'cua_windows', 'cua_ax_tree', 'cua_screenshot', 'cua_click',
+  'cua_set_value', 'cua_action', 'cua_select_text', 'cua_paste', 'cua_scroll', 'cua_drag',
   'cua_type', 'cua_key', 'cua_app_focus', 'cua_verify',
 ];
 
@@ -132,9 +133,15 @@ const FAKE_HELPERS = {
   windows: { windows: [{ windowId: 42, ownerPid: 4321, ownerName: 'FakeApp', title: 'Fake Win', bounds: { x: 10, y: 20, w: 800, h: 600 }, onScreen: true }] },
   'ax-tree': { nodes: [{ depth: 0, role: 'AXWindow', title: 'Fake Win' }, { depth: 1, role: 'AXButton', title: 'OK' }], truncated: false },
   'element-click': { pressed: true },
+  'set-value': { set: true, verified: true, role: 'AXTextField', title: 'Name', valueLength: 5 },
+  'perform-action': { performed: true, action: 'AXPress', availableActions: ['AXRaise', 'AXPress'] },
+  'select-text': { selected: true, verified: true, selection: 'text', range: { location: 6, length: 5 }, textLength: 5 },
+  paste: { pasted: true, chars: 5, format: 'text', clipboardRestored: true, realFocus: true },
+  scroll: { scrolled: true, via: 'ax-scrollbar', bar: 'vertical', value: 0.1, verified: true, pages: 2, dx: 0, dy: -800, steps: 2, direction: 'down', windowId: 42, targeted: true, syntheticFocus: false },
+  drag: { dragged: true, from: [1, 2], to: [3, 4], steps: 12, durationMs: 300, windowId: 42, targeted: true, syntheticFocus: true },
   'xy-click': { x: 1, y: 2, targeted: true },
-  type: { chars: 5 },
-  key: { key: 'q', keyCode: 12, modifiers: ['cmd'] },
+  type: { chars: 5, realFocus: true },
+  key: { key: 'q', keyCode: 12, modifiers: ['cmd'], realFocus: true },
   'app-focus': { axRaised: true, appActivated: true },
   'overlay-show': {},
   'overlay-hide': {},
@@ -548,7 +555,7 @@ async function startMcpStack(cua, policy) {
   };
 }
 
-test('MCP：9 个 cua_* 工具已注册；cua_status / cua_screenshot / cua_key 走完整 MCP 线缆', async () => {
+test('MCP：15 个 cua_* 工具已注册；cua_status / cua_screenshot / cua_key 走完整 MCP 线缆', async () => {
   const t = tierAFixture();
   const s = await startMcpStack(t.cua, t.policy); // 共享同一 policy：ab_confirm 批准的 token 才能放行 cua_key
   try {
@@ -653,6 +660,34 @@ test('Swift 助手自检：编译到临时目录 → probe/windows/ax-tree（ax-
       assert.equal(noXY.code, 'bad-args');
       const hidden = await client.request('overlay-hide');
       assert.equal(hidden.ok, true);
+
+      // v1.1.0 定向点击安全边界：给了 pid 但该 pid 在点击点没有窗口 → 结构化 no-window-at-point，
+      // 绝不盲点当前前台应用（本进程没有窗口，坐标 (0,0) 也不会命中任何目标窗口）
+      const noWin = await client.request('xy-click', { x: 0, y: 0, pid: process.pid }).then((v) => v, (err) => err);
+      assert.equal(noWin.code, 'no-window-at-point');
+      assert.match(noWin.message, /未执行/);
+      // release-focus 幂等（没有合成激活也应 ok）
+      assert.equal((await client.request('release-focus')).ok, true);
+      // PiP 状态诊断：未动作时应不可见
+      const pip = await client.request('pip-stats');
+      assert.equal(pip.visible, false);
+      assert.equal(pip.via, 'none');
+
+      // v1.1.1 AX 写值 / 次级动作：非 GUI 进程没有 AX 元素 → 结构化 element-not-found（未授权则 not-granted）
+      const setErr = await client.request('set-value', { pid: process.pid, role: 'AXButton', value: 'x' }).then((v) => v, (err) => err);
+      assert.equal(setErr.code, probe.axGranted ? 'element-not-found' : 'not-granted');
+      const actErr = await client.request('perform-action', { pid: process.pid, role: 'AXButton', action: 'AXPress' }).then((v) => v, (err) => err);
+      assert.equal(actErr.code, probe.axGranted ? 'element-not-found' : 'not-granted');
+
+      // v1.1.2 select-text / paste / scroll / drag 的结构化错误（均不触碰前台/剪贴板）
+      const selErr = await client.request('select-text', { pid: process.pid, role: 'AXButton', text: 'x' }).then((v) => v, (err) => err);
+      assert.equal(selErr.code, probe.axGranted ? 'element-not-found' : 'not-granted');
+      const pasteErr = await client.request('paste', { pid: process.pid, text: 'x', format: 'bogus' }).then((v) => v, (err) => err);
+      assert.equal(pasteErr.code, 'bad-format');
+      const scrollErr = await client.request('scroll', { pid: process.pid, direction: 'down' }).then((v) => v, (err) => err);
+      assert.equal(scrollErr.code, 'no-window-at-point');
+      const dragErr = await client.request('drag', { pid: process.pid, fromX: 0, fromY: 0, toX: 1, toY: 1 }).then((v) => v, (err) => err);
+      assert.equal(dragErr.code, 'no-window-at-point');
 
       // permission-card 协议（真窗口能力：卡片会真闪现 <1 秒，随即收起——被测的就是窗口本身）
       const badCard = await client.request('show-permission-card', { kind: 'bogus' }).then((v) => v, (err) => err);
@@ -796,6 +831,7 @@ test('cua-app：ensureCuaHelperApp 建齐 .app 结构（Info.plist 要件/可执
     assert.ok(plist.includes(`<string>${CUA_APP_NAME}</string>`), 'CFBundleName=AgentDesk');
     assert.ok(plist.includes('<key>LSUIElement</key>'), 'LSUIElement（后台 App 无 Dock 图标）');
     assert.ok(plist.includes('<key>NSAppleEventsUsageDescription</key>'), '用途描述键在');
+    assert.ok(plist.includes('<key>NSScreenCaptureUsageDescription</key>'), '屏幕捕获用途描述键在（实时 PiP）');
     assert.ok(plist.includes('AgentDesk screen control'), '用途描述内容');
     assert.ok(plist.includes('<string>cua-helper</string>'), 'CFBundleExecutable');
 
@@ -1464,4 +1500,175 @@ test('卡片开关纯函数：missingCardKinds 顺序与取舍；showGuideCards 
   assert.deepEqual(ok2.calls.hideCard, ['accessibility', 'screen']);
   await hideGuideCards({ async hidePermissionCard() { throw new Error('dead'); } }, ['accessibility']);
   await hideGuideCards(fakeCua({}), []);
+});
+
+// ---------- v1.1.0 合成激活 + 定向投递 ----------
+
+test('合成激活点击：targeted+syntheticFocus 原样回执；全局兜底如实标注；元素坐标兜底也带定向标记', async () => {
+  const f = fixture();
+  const logFile = join(f.dir, 'helper-log.jsonl');
+  const bin = writeFakeHelper(f.dir, {
+    probe: FAKE_HELPERS.probe,
+    windows: FAKE_HELPERS.windows,
+    'xy-click': { x: 100, y: 200, targeted: true, syntheticFocus: true, windowId: 42 },
+    'element-click': { xyFallback: true, bounds: { x: 1, y: 2, w: 10, h: 20 }, at: [5, 6], targeted: true, syntheticFocus: true, windowId: 42 },
+  }, logFile);
+  const cua = createCua({ audit: f.audit, policy: f.policy, helperPath: bin, execRunner: fakeExec() });
+  try {
+    const xy = await cua.click({ x: 100, y: 200, pid: 4321 });
+    assert.equal(xy.targeted, true);
+    assert.equal(xy.syntheticFocus, true, '合成激活标记要透传给调用方');
+    assert.equal(xy.fallback, undefined, '定向成功时不应出现 fallback');
+    assert.equal(xy.windowId, 42);
+
+    const el = await cua.click({ pid: 4321, role: 'AXButton', title: 'OK' });
+    assert.equal(el.xyFallback, true);
+    assert.equal(el.targeted, true, '元素坐标兜底同样走定向投递');
+    assert.equal(el.syntheticFocus, true);
+  } finally {
+    cua.stop();
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+
+  const f2 = fixture();
+  const logFile2 = join(f2.dir, 'helper-log.jsonl');
+  const bin2 = writeFakeHelper(f2.dir, {
+    probe: FAKE_HELPERS.probe,
+    windows: FAKE_HELPERS.windows,
+    'xy-click': { targeted: false, fallback: 'global' },
+  }, logFile2);
+  const cua2 = createCua({ audit: f2.audit, policy: f2.policy, helperPath: bin2, execRunner: fakeExec() });
+  try {
+    const g = await cua2.click({ x: 1, y: 2, pid: 4321 });
+    assert.equal(g.fallback, 'global', '无窗口/无 pid 的全局兜底必须如实回执');
+    assert.equal(g.syntheticFocus, undefined);
+    assert.equal(g.targeted, false);
+  } finally {
+    cua2.stop();
+    rmSync(f2.dir, { recursive: true, force: true });
+  }
+});
+
+// ---------- v1.1.1 AX 写值 / 次级动作 ----------
+
+test('AX 写值与次级动作：请求形状、回执、审计脱敏、能力错误透传', async () => {
+  const t = tierAFixture();
+  try {
+    const sv = await t.cua.setValue({ pid: 4321, role: 'AXTextField', title: 'Name', value: 'hello' });
+    assert.equal(sv.mode, 'set-value');
+    assert.equal(sv.verified, true);
+    assert.equal(sv.valueLength, 5);
+
+    const act = await t.cua.performAction({ pid: 4321, role: 'AXButton', title: 'OK', action: 'axpress' });
+    assert.equal(act.mode, 'action');
+    assert.equal(act.action, 'AXPress', 'helper 返回的规范化动作名优先');
+    assert.deepEqual(act.availableActions, ['AXRaise', 'AXPress']);
+
+    const log = readHelperLog(t.logFile);
+    const setReq = log.find((r) => r.cmd === 'set-value');
+    assert.deepEqual({ pid: setReq.pid, role: setReq.role, title: setReq.title, value: setReq.value },
+      { pid: 4321, role: 'AXTextField', title: 'Name', value: 'hello' });
+    const actReq = log.find((r) => r.cmd === 'perform-action');
+    assert.deepEqual({ pid: actReq.pid, role: actReq.role, title: actReq.title, action: actReq.action },
+      { pid: 4321, role: 'AXButton', title: 'OK', action: 'axpress' });
+
+    const audited = t.audit.query({ cmd: 'cua_setValue' });
+    const entry = audited.entries[0];
+    assert.equal(entry.paramsLite.text, '[redacted]', '写入值必须脱敏');
+    assert.equal(entry.paramsLite.chars, 5);
+    assert.ok(!JSON.stringify(entry).includes('hello'), '审计里不得出现原值');
+  } finally {
+    t.cua.stop();
+    rmSync(t.dir, { recursive: true, force: true });
+  }
+
+  // helper 能力错误原样透传
+  const f = fixture();
+  const logFile = join(f.dir, 'helper-log.jsonl');
+  const bin = writeFakeHelper(f.dir, {
+    probe: FAKE_HELPERS.probe,
+    windows: FAKE_HELPERS.windows,
+    'set-value': { __err: '元素 AXValue 不可写', code: 'value-not-settable' },
+    'perform-action': { __err: '元素不支持动作', code: 'action-not-available' },
+  }, logFile);
+  const cua = createCua({ audit: f.audit, policy: f.policy, helperPath: bin, execRunner: fakeExec() });
+  try {
+    await assert.rejects(cua.setValue({ pid: 4321, role: 'AXButton', value: 'x' }), (err) => err.code === 'value-not-settable');
+    await assert.rejects(cua.performAction({ pid: 4321, role: 'AXButton', action: 'Nope' }), (err) => err.code === 'action-not-available');
+  } finally {
+    cua.stop();
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+// ---------- v1.1.2 select_text / paste / scroll / drag ----------
+
+test('select_text/paste/scroll/drag：请求形状、回执、审计脱敏', async () => {
+  const t = tierAFixture();
+  try {
+    const st = await t.cua.selectText({ pid: 4321, role: 'AXTextField', title: 'Name', text: 'hello', selection: 'cursor_after' });
+    assert.equal(st.mode, 'select-text');
+    assert.equal(st.verified, true);
+    assert.deepEqual(st.range, { location: 6, length: 5 });
+    assert.equal(st.selection, 'cursor_after');
+
+    const pa = await t.cua.paste({ pid: 4321, text: 'hello', format: 'text' });
+    assert.equal(pa.mode, 'paste');
+    assert.equal(pa.chars, 5);
+    assert.equal(pa.clipboardRestored, true);
+    assert.equal(pa.realFocus, true, '键盘真实激活标记要透传');
+
+    const sc = await t.cua.scroll({ pid: 4321, direction: 'down', pages: 2 });
+    assert.equal(sc.mode, 'scroll');
+    assert.equal(sc.dy, -800);
+    assert.equal(sc.steps, 2);
+    assert.equal(sc.via, 'ax-scrollbar');
+    assert.equal(sc.bar, 'vertical');
+    assert.equal(sc.value, 0.1);
+    assert.equal(sc.verified, true);
+
+    const dr = await t.cua.drag({ pid: 4321, fromX: 1, fromY: 2, toX: 3, toY: 4 });
+    assert.equal(dr.mode, 'drag');
+    assert.equal(dr.steps, 12);
+    assert.equal(dr.windowId, 42);
+
+    const log = readHelperLog(t.logFile);
+    const selReq = log.find((r) => r.cmd === 'select-text');
+    assert.deepEqual({ pid: selReq.pid, role: selReq.role, text: selReq.text, selection: selReq.selection },
+      { pid: 4321, role: 'AXTextField', text: 'hello', selection: 'cursor_after' });
+    const pasteReq = log.find((r) => r.cmd === 'paste');
+    assert.deepEqual({ pid: pasteReq.pid, text: pasteReq.text, format: pasteReq.format },
+      { pid: 4321, text: 'hello', format: 'text' });
+    const scrollReq = log.find((r) => r.cmd === 'scroll');
+    assert.deepEqual({ pid: scrollReq.pid, direction: scrollReq.direction, pages: scrollReq.pages },
+      { pid: 4321, direction: 'down', pages: 2 });
+    const dragReq = log.find((r) => r.cmd === 'drag');
+    assert.deepEqual({ pid: dragReq.pid, fromX: dragReq.fromX, fromY: dragReq.fromY, toX: dragReq.toX, toY: dragReq.toY },
+      { pid: 4321, fromX: 1, fromY: 2, toX: 3, toY: 4 });
+
+    const selAudit = t.audit.query({ cmd: 'cua_selectText' }).entries[0];
+    assert.equal(selAudit.paramsLite.text, '[redacted]');
+    const pasteAudit = t.audit.query({ cmd: 'cua_paste' }).entries[0];
+    assert.equal(pasteAudit.paramsLite.text, '[redacted]');
+    assert.ok(!JSON.stringify(selAudit).includes('hello'));
+    assert.ok(!JSON.stringify(pasteAudit).includes('hello'));
+  } finally {
+    t.cua.stop();
+    rmSync(t.dir, { recursive: true, force: true });
+  }
+});
+
+test('swift 源码实现 PiP 控制指示器 / 键盘真激活 / AX 滚动条 / select-text', () => {
+  const src = readFileSync(SWIFT_SRC_PATH, 'utf8');
+  assert.match(src, /ControlPiPController/, 'PiP 控制指示器');
+  assert.match(src, /AgentDesk 正在操作/, '指示器文案');
+  assert.match(src, /nonactivatingPanel/, '非激活面板');
+  assert.match(src, /ignoresMouseEvents = true/, '点击穿透');
+  assert.match(src, /activateForKeyboard/, '键盘真激活路径');
+  assert.match(src, /restoreAfterKeyboard/, '键盘完成后恢复前台');
+  assert.match(src, /kAXVerticalScrollBarAttribute/, 'AX 滚动条滚动');
+  assert.match(src, /AXValueCreate\(\.cfRange/, 'AXSelectedTextRange 选中文本');
+  assert.match(src, /PiPLiveStream/, 'ScreenCaptureKit 实时流');
+  assert.match(src, /SCContentFilter\(desktopIndependentWindow/, '按窗口捕获');
+  assert.match(src, /startCapture/, 'SCStream 启动');
 });
