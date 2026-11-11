@@ -4,6 +4,16 @@
 
 **纯本地架构**：所有指令只在你机器上的 127.0.0.1 里流动，不出网、无云端组件、无需账号。
 
+## 环境要求
+
+| 项 | 要求 |
+|---|---|
+| 系统 | **macOS**（已知限制：Windows 分支已实现但未实机验证；Linux 未支持屏幕通道） |
+| Node.js | **18+**（`node -v` 能出版本号即可） |
+| 浏览器 | Chrome / Edge / Brave / Opera / Vivaldi / Arc（Chromium 系；Safari/Firefox 不支持） |
+| AI 客户端 | 任意支持 MCP 的客户端：Codex / Claude Code / Claude Desktop / Cursor / Windsurf / VS Code(Copilot) / DeepSeek Harness 等 |
+| 权限 | 首次使用需在系统设置里授予「辅助功能」「屏幕录制」（setup 会自动引导） |
+
 ## 架构（五层）
 
 ```
@@ -111,10 +121,23 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 源码用户 `npm run uninstall`。两者都只删本机直连配置（token/端口）、旧版清单残留与 AgentDesk.app，Chrome 内手动移除扩展即彻底干净。
 
 高级参数：`agentdesk -- --no-open`（不自动开 Chrome）/ `--port N` / `--timeout 秒` /
-`--browser all|chrome|edge|brave|opera|vivaldi|arc` / `--dry-run`（源码用户等价命令 `npm run setup -- …`）。
+`--browser all|chrome|edge|brave|opera|vivaldi|arc` / `--dry-run` / `--no-mcp-config`（不自动写 AI 客户端配置）。
+源码用户等价命令：`npm run setup -- …`。
 
 更新到新版：npm 安装用户 `npm update -g @xiixiixixi/agentdesk`；源码用户 `git pull && npm install`。
 两者升级后扩展无需重新加载（ID 不变），但建议重跑一次 setup 刷新配置与 AgentDesk.app。
+
+## 多个浏览器：只控一个（受控权互斥）
+
+如果你在多个 Chromium 浏览器（比如 Chrome + Arc）里都装了本扩展，同一时刻只有**一个**浏览器受控：
+
+- 每个扩展弹窗有一个开关「允许 AI 控制本浏览器」，**默认开**；
+- 打开某个浏览器的开关 = 把受控权抢到它，另一个浏览器**自动变待机**（开关弹回关闭，提示“待机：chrome 157 受控中”）；
+- 点哪个用哪个，**不需要先关掉另一个**；受控浏览器断开后，受控权自动交给还在线的另一个；
+- 不想让某个浏览器参与：在它弹窗里把开关关掉（= 断开、不连接）；
+- 默认浏览器（不指定 `browserId` 时）永远跟随受控者。
+
+> Arc 的标签接口兼容性较差（v1.0.1 加超时兜底后已可用，但仍建议日常只开一个浏览器）。
 
 ## 服务生命周期（常问三问）
 
@@ -262,10 +285,47 @@ npm run credential -- remove https://github.com
 - 剪贴板写入返回「不支持，请用定位器输入」（诚实报错）；`downloads.open` 需 Chrome 可选权限；嵌套 iframe 内的元素定位暂不支持（`ab_login` 因此也只认主文档里的登录表单）。
 - 扩展 ID 依赖目录绝对路径：源码安装挪目录后需重跑 setup 并重新加载扩展；npm 全局安装不受影响（路径固定）。发布到 Chrome 商店后此限制彻底消失。
 
+## 常见问题（FAQ）
+
+**Q：装完怎么没看到 AgentDesk 这个 App？**
+A：它装在 `~/.agentdesk/AgentDesk.app`（隐藏目录，不在 /Applications）；它只是权限持有者，不需要日常打开。
+Finder 里按 ⌘⇧G 输入 `~/.agentdesk` 即可看到。
+
+**Q：服务平时不在运行，正常吗？**
+A：正常。它是按需进程：AI 客户端发起会话时才由 MCP 客户端拉起；没有会话就不存在。下次用会自动起来，
+会话中途挂了也会由前端实例接管端口，扩展 30 秒内自动重连。
+
+**Q：扩展页面有红色“错误”？**
+A：多数是服务没启动时 WebSocket 连接被拒的历史日志（`ERR_CONNECTION_REFUSED`）。
+服务起来后会自动重连；在 `chrome://extensions` 点“错误 → 清除全部”即可清掉旧记录。
+持续报错就跑 `agentdesk-doctor`（仓库里是 `npm run doctor`）。
+
+**Q：端口 7331 被占用？**
+A：说明已经有 agentdesk 服务在跑（可能另一个 MCP 客户端会话，或你手动起的服务）。
+不需要重复起；`npm run verify` 这类需要独占端口的测试，请先退出正在使用它的客户端会话。
+
+**Q：Chrome 商店搜不到 / 没上架？**
+A：暂未上架（需要一次性 $5 开发者账号，可选）。用本文“加载已解压的扩展程序”方式安装即可，功能完全一致；
+给别人装就是把 `npm install -g @xiixiixixi/agentdesk` + `agentdesk` + 一次加载扩展发过去。
+
+**Q：怎么确认装好了？**
+A：`npm run doctor` 全绿 + 对 AI 说“打开 example.com 截图”能出图，就是好了。
+
 ## 测试
 
+### 人工测试（最真实）
+
+装好后对任意 AI 客户端说一句：
+
+- “用 agentdesk 打开 example.com 并截图” → 浏览器通道通
+- “帮我读一下 https://httpbin.org/html 的正文” → 批量读页通
+- “截一下屏幕上 XX 应用的窗口” → 屏幕通道通
+- 看扩展弹窗显示「受控中 / 待机」→ 多浏览器互斥正常
+
+### 命令测试（仓库目录下）
+
 ```bash
-npm test          # 140+ 个单元测试
+npm test          # 160+ 个单元测试
 npm run selftest  # 全链路自检（真 WS + 伪扩展，无需浏览器）
 npm run cua-selftest  # 屏幕通道自检（只读探测 + 试拍，不做任何点击）
 npm run doctor    # 本机链路体检：扩展目录/直连配置/端口监听/AgentDesk 与授权，逐项给修复建议
