@@ -9,7 +9,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdi
 import os from 'node:os';
 import path from 'node:path';
 
-import { applyMcpConfigs, buildServerCommand, detectMcpClients } from '../installer/mcp-config.mjs';
+import { applyMcpConfigs, buildServerCommand, detectMcpClients, universalInstructions } from '../installer/mcp-config.mjs';
 
 const NODE = '/usr/local/bin/node';
 const ENTRY = '/opt/agentdesk/service/mcp-entry.mjs';
@@ -98,4 +98,30 @@ test('npx 模式写入 npx 命令', () => {
   const cursor = JSON.parse(readFileSync(path.join(home, '.cursor/mcp.json'), 'utf8'));
   assert.equal(cursor.mcpServers.agentdesk.command, 'npx');
   assert.deepEqual(cursor.mcpServers.agentdesk.args, ['-y', '--package=@xiixiixixi/agentdesk', 'agentdesk-mcp']);
+});
+
+test('VS Code（servers 键）与 Windsurf 也能自动写入', () => {
+  const home = makeHome({
+    'Library/Application Support/Code/User/mcp.json': JSON.stringify({ servers: { other: { command: 'y' } } }),
+    '.codeium/windsurf/mcp_config.json': '{}',
+  });
+  const r = applyMcpConfigs({ home, nodePath: NODE, entryPath: ENTRY });
+  assert.deepEqual(r.map((x) => x.status), ['written', 'written']);
+  const vscode = JSON.parse(readFileSync(path.join(home, 'Library/Application Support/Code/User/mcp.json'), 'utf8'));
+  assert.equal(vscode.servers.agentdesk.command, NODE);
+  assert.deepEqual(vscode.servers.agentdesk.args, [ENTRY]);
+  assert.ok(vscode.servers.other, '原有 servers 保留');
+  const wind = JSON.parse(readFileSync(path.join(home, '.codeium/windsurf/mcp_config.json'), 'utf8'));
+  assert.equal(wind.mcpServers.agentdesk.command, NODE);
+});
+
+test('universalInstructions：给出 stdio 命令、JSON 片段和可转发给 AI 的一句话', () => {
+  const lines = universalInstructions({ nodePath: NODE, entryPath: ENTRY });
+  const text = lines.join('\n');
+  assert.match(text, /stdio/);
+  assert.match(text, /mcpServers/);
+  assert.match(text, /agentdesk/);
+  assert.match(text, new RegExp(ENTRY.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  const npxLines = universalInstructions({ nodePath: NODE, entryPath: ENTRY, npx: true }).join('\n');
+  assert.match(npxLines, /npx/);
 });

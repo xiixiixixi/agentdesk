@@ -27,7 +27,7 @@ import { ConnectionManager } from './service/connection.mjs';
 import { compileHelper, createCua } from './service/cua.mjs';
 import { ensureCuaHelperApp } from './service/cua-app.mjs';
 import { missingPermissions, showGuideCards } from './service/cua-guide.mjs';
-import { applyMcpConfigs } from './installer/mcp-config.mjs';
+import { applyMcpConfigs, universalInstructions } from './installer/mcp-config.mjs';
 
 // setup.mjs 位于仓库根，REPO_ROOT 就是它所在目录（此前误用 '..' 多退一级）
 const REPO_ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -198,11 +198,8 @@ async function main() {
     }
   }
   log('');
-  log('⑦ 给 MCP 客户端的配置（上面没检测到的客户端，复制即用）：');
-  log('npm 安装用户（推荐）：');
-  log(JSON.stringify({ mcpServers: { agentdesk: { command: 'agentdesk-mcp' } } }));
-  log('源码（git clone）用户：');
-  log(JSON.stringify({ mcpServers: { agentdesk: { command: 'node', args: [entry] } } }));
+  log('⑦ 通用接入说明（任何 MCP 客户端；也可整段发给 AI 让它自己写配置）：');
+  for (const line of universalInstructions({ nodePath: process.execPath, entryPath: entry, npx: npxMode })) log('   ' + line);
 
   // 8. 屏幕操作（CUA）助手：可选增强，编译失败不算安装失败（B 层 osascript 兜底）
   log('');
@@ -214,6 +211,10 @@ async function main() {
     const app = ensureCuaHelperApp({ srcBinary: cua.path, log: (m) => log(`   ${m}`) });
     if (app.installed) {
       log(`   ✓ 已安装 ${app.appPath}（权限主体；图标=${app.iconInstalled ? '已装' : '缺'}）`);
+      log('     路径在隐藏目录 ~/.agentdesk/ 下；Finder 里按 ⌘⇧G 输入 ~/.agentdesk 即可看到。');
+      if (isMac && !args.noOpen) {
+        try { spawn('open', ['-R', app.appPath], { stdio: 'ignore', detached: true }).unref(); log('     （已在 Finder 中显示）'); } catch { /* 打不开不影响 */ }
+      }
     } else {
       log(`   - AgentDesk.app 安装失败（${app.reason}）——权限将挂到运行服务的终端上（老行为）。`);
     }

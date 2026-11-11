@@ -50,13 +50,28 @@ MCP 配置（无需路径，命令已进 PATH）：
 
 ### 各客户端接入示例（已装 agentdesk-mcp 的前提下）
 
-| 客户端 | 配置位置 | 写法 |
-|---|---|---|
-| DeepSeek Harness | `~/.dsh/cordis.patch.yml` | 见下方 MCP 客户端定义（`serverName: agentdesk` + `command: agentdesk-mcp`） |
-| Codex | `~/.codex/config.toml` | `[mcp_servers.agentdesk]` → `command = "agentdesk-mcp"` |
-| Claude Code | `~/.claude.json` 的 `mcpServers` | `{"type":"stdio","command":"agentdesk-mcp"}` |
-| Cursor | `~/.cursor/mcp.json` 的 `mcpServers` | 同上 |
-| 其他 MCP 客户端 | 任意 | stdio：`agentdesk-mcp` |
+`agentdesk` 会**自动检测并写入**这些客户端（写前备份、已存在跳过、`--no-mcp-config` 可关）：
+
+| 客户端 | 配置位置 |
+|---|---|
+| DeepSeek Harness | `~/.dsh/cordis.patch.yml` |
+| Codex | `~/.codex/config.toml` |
+| Claude Code | `~/.claude.json` |
+| Claude Desktop | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Cursor | `~/.cursor/mcp.json` |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` |
+| VS Code（Copilot MCP） | `~/Library/Application Support/Code/User/mcp.json`（`servers` 键） |
+
+### 通用接入（没被上面的列表覆盖时）
+
+MCP 没有“通用配置文件标准”，但**所有客户端都支持 stdio MCP server**，所以有通用写法。
+setup 最后会打印下面这段，也可以直接把它发给你的 AI 让它自己写配置：
+
+```json
+{ "mcpServers": { "agentdesk": { "command": "agentdesk-mcp" } } }
+```
+
+> “请把 agentdesk 加入你的 MCP 配置：stdio，命令 `agentdesk-mcp`（或 `node <安装路径>/service/mcp-entry.mjs`）；配置完重启生效。”
 
 其他命令：`agentdesk-doctor`（体检）、`agentdesk-uninstall`（卸载）、
 `agentdesk -- --no-open/--port/--browser arc` 等参数照旧。
@@ -64,7 +79,7 @@ MCP 配置（无需路径，命令已进 PATH）：
 > **Chrome 商店上架是可选的**：商店只是一键安装渠道，需要一次性 $5 开发者账号；暂未上架不影响使用——
 > 按下面的“开发者模式加载扩展”方式安装即可，功能完全一致。
 
-> **一条命令覆盖了什么**：装助手 App、写直连配置（token/端口）、写本机已安装 AI 客户端的 MCP 配置、
+> **一条命令覆盖了什么**：装助手 App、写直连配置（token/端口）、写本机已安装 AI 客户端的 MCP 配置（Codex/Claude/Cursor/Windsurf/VS Code/DSH）、
 > 打开扩展页并复制目录路径、等待扩展回连验证。**唯一剩下的手动步骤就是 Chrome 里点一次
 > “加载已解压的扩展程序”**（Chrome 不允许程序静默安装扩展，商店上架后才可能省掉）。
 
@@ -78,6 +93,9 @@ npm run setup
 MCP 配置指向 `node /绝对路径/agentdesk/service/mcp-entry.mjs`。
 
 </details>
+
+辅助程序装在 **`~/.agentdesk/AgentDesk.app`**（隐藏目录；Finder 里按 ⌘⇧G 输入 `~/.agentdesk` 即可看到，
+setup 结束时也会自动在 Finder 中显示它）。它只是屏幕操作权限的持权主体，不是日常打开的 App。
 
 setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开发者模式 →
 「加载已解压的扩展程序」→ 粘贴剪贴板里的目录路径。验证打钩后，setup 直接给出
@@ -103,6 +121,8 @@ setup 会打印唯一的手动步骤：Chrome 的 `chrome://extensions` → 开�
 - **要开机自启吗？** 不用。`npm install` 只是放文件，不启动任何东西。
 - **服务什么时候启动？** MCP 客户端发起会话时按配置拉起 `mcp-entry.mjs` 子进程；客户端退出
   （stdin 关闭）或关掉会话，进程随之优雅退出。没有客户端连它，它就不存在。
+- **服务停了怎么办？** 不用管：下次 AI 客户端发起会话会自动拉起（这正是“按需进程”的设计）；
+  如果服务进程在会话中途退出，正在连它的前端实例会自动**接管端口成为新服务**，扩展 30 秒内自动重连。
 - **独立跑过服务又退出了，列表变空？** 服务是按需进程：`npm run doctor` 一条命令看断点；空列表≠报错，先 doctor。
 - **服务中途死了怎么办？** 前端模式的进程会自动**接管端口变成新服务**（浏览器扩展自动重连，AI 客户端全程无感）；连续恢复失败才退出待重拉。
 - **多个 MCP 客户端同时用？** 支持。第一个实例充当 service 并监听端口；后续实例探测到

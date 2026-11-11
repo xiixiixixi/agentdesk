@@ -29,6 +29,8 @@ export function detectMcpClients(home) {
     { label: 'Claude Code', file: path.join(home, '.claude.json'), kind: 'json' },
     { label: 'Claude Desktop', file: path.join(home, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json'), kind: 'json' },
     { label: 'Cursor', file: path.join(home, '.cursor', 'mcp.json'), kind: 'json' },
+    { label: 'Windsurf', file: path.join(home, '.codeium', 'windsurf', 'mcp_config.json'), kind: 'json' },
+    { label: 'VS Code (Copilot MCP)', file: path.join(home, 'Library', 'Application Support', 'Code', 'User', 'mcp.json'), kind: 'vscode' },
     { label: 'DeepSeek Harness', file: path.join(home, '.dsh', 'cordis.patch.yml'), kind: 'dsh' },
   ];
   return specs.filter((s) => existsSync(s.file));
@@ -44,7 +46,7 @@ function backup(file, ts, dryRun, results, label) {
   }
 }
 
-function writeJsonClient(client, server, opts, results) {
+function writeJsonClient(client, server, opts, results, serversKey = 'mcpServers') {
   const { dryRun, ts } = opts;
   let doc;
   try { doc = JSON.parse(readFileSync(client.file, 'utf8')); } catch {
@@ -55,13 +57,13 @@ function writeJsonClient(client, server, opts, results) {
     results.push({ label: client.label, file: client.file, status: 'skip', reason: 'JSON 顶层不是对象，未改动' });
     return;
   }
-  const servers = (doc.mcpServers && typeof doc.mcpServers === 'object' && !Array.isArray(doc.mcpServers)) ? doc.mcpServers : {};
+  const servers = (doc[serversKey] && typeof doc[serversKey] === 'object' && !Array.isArray(doc[serversKey])) ? doc[serversKey] : {};
   if (servers[MCP_SERVER_NAME]) {
     results.push({ label: client.label, file: client.file, status: 'exists' });
     return;
   }
   servers[MCP_SERVER_NAME] = { type: 'stdio', command: server.command, args: server.args };
-  doc.mcpServers = servers;
+  doc[serversKey] = servers;
   if (!dryRun) {
     backup(client.file, ts, dryRun, results, client.label);
     writeFileSync(client.file, JSON.stringify(doc, null, 2) + '\n');
@@ -122,6 +124,23 @@ function writeDsh(client, server, opts, results) {
 }
 
 /**
+ * 通用接入说明：任何支持 MCP 的客户端都能用（也方便让 AI agent 自己写配置）。
+ * 返回可直接打印/转发的若干行文本。
+ */
+export function universalInstructions({ nodePath, entryPath, npx = false } = {}) {
+  const server = buildServerCommand({ nodePath, entryPath, npx });
+  const json = JSON.stringify({ mcpServers: { agentdesk: { command: server.command, args: server.args } } });
+  const cmd = [server.command, ...server.args].map((x) => (/\s/.test(x) ? JSON.stringify(x) : x)).join(' ');
+  return [
+    '任何支持 MCP 的客户端都能接（不依赖具体客户端）：',
+    '  1) stdio MCP server；命令：' + cmd,
+    '  2) 或把下面这句发给你的 AI 客户端，让它自己写配置：',
+    '     “请把 agentdesk 加入你的 MCP 配置：stdio，命令 ' + server.command + '，参数 ' + JSON.stringify(server.args) + '；配置完重启生效。”',
+    '  3) JSON 通用片段（mcpServers 风格）：' + json,
+  ];
+}
+
+/**
  * 写入（或 dry-run 报告）各客户端 MCP 配置。
  * @returns {Array<{label,file,status:'written'|'would-write'|'exists'|'skip'|'error',reason?}>}
  */
@@ -136,6 +155,7 @@ export function applyMcpConfigs({ home, nodePath, entryPath, npx = false, dryRun
     try {
       if (client.kind === 'codex') writeCodex(client, server, opts, results);
       else if (client.kind === 'dsh') writeDsh(client, server, opts, results);
+      else if (client.kind === 'vscode') writeJsonClient(client, server, opts, results, 'servers');
       else writeJsonClient(client, server, opts, results);
     } catch (e) {
       results.push({ label: client.label, file: client.file, status: 'error', reason: e.message });
