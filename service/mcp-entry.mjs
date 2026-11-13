@@ -21,7 +21,7 @@
 // 参数解析直接复用 service.mjs 导出的 parseArgs。
 
 import process from 'node:process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -194,8 +194,10 @@ export async function main(argv = process.argv.slice(2)) {
   return 0;
 }
 
-// 作为脚本直接运行时才启动（被 import 时不执行）
-const invoked = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+// 作为脚本直接运行时才启动（被 import 时不执行）。
+// argv[1] 须先 realpathSync：npm 全局 bin（agentdesk-mcp）是指向本文件的符号链接，
+// 而 ESM 的 import.meta.url 解析为真实路径，直接比较永不相等 → main 不执行、静默退出。
+const invoked = process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
 if (invoked) {
   main().then((code) => process.exit(code)).catch((err) => {
     process.stderr.write(`[cab-mcp] fatal: ${err.message}\n`);
