@@ -23,7 +23,7 @@
 import process from 'node:process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { isMain } from '../shared/is-main.mjs';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ConnectionManager } from './connection.mjs';
@@ -68,7 +68,7 @@ export async function main(argv = process.argv.slice(2)) {
   // 优先级：--port 参数 > setup.mjs 写入的 host/host-config.json（浏览器宿主按它连入）> 默认 7331
   if (!argv.includes('--port')) {
     try {
-      const cfg = JSON.parse(readFileSync(resolve(path.dirname(fileURLToPath(import.meta.url)), '../host/host-config.json'), 'utf8'));
+      const cfg = JSON.parse(readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../host/host-config.json'), 'utf8'));
       if (Number.isInteger(cfg.servicePort) && cfg.servicePort > 0 && cfg.servicePort < 65536) args.port = cfg.servicePort;
     } catch { /* 无配置文件则用默认端口 */ }
   }
