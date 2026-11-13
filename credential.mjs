@@ -11,8 +11,8 @@
 import process from 'node:process';
 import readline from 'node:readline';
 import { Writable } from 'node:stream';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { isMain } from './shared/is-main.mjs';
 import { createCredentials } from './service/credentials.mjs';
 
 const USAGE = [
@@ -126,8 +126,7 @@ export async function runCli(argv, { credentials = createCredentials(), io = nul
 }
 
 // 作为脚本直接运行时才启动（被 import 时不执行）
-const invoked = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
-if (invoked) {
+if (isMain(import.meta.url)) {
   runCli(process.argv.slice(2)).then((code) => process.exit(code)).catch((err) => {
     process.stderr.write(`credential: ${err.message}\n`);
     process.exit(1);

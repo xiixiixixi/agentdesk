@@ -13,8 +13,9 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { BROWSERS, FAMILY_NAMES, MANIFEST_BASENAME, NATIVE_HOST_NAME, manifestPathsForFamily } from './install.mjs';
+import { isMain } from '../shared/is-main.mjs';
 
 function runCommand(command, args) {
   try {
@@ -393,16 +394,7 @@ async function main() {
   process.exitCode = exitCode;
 }
 
-const isMain = () => {
-  if (!process.argv[1]) return false;
-  try {
-    return pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
-  } catch {
-    return false;
-  }
-};
-
-if (isMain()) {
+if (isMain(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`discovery: ${error instanceof Error ? error.message : String(error)}\n`);
     process.exit(2);

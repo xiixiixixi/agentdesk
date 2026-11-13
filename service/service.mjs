@@ -10,8 +10,9 @@
 
 import process from 'node:process';
 import { once } from 'node:events';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import { isMain } from '../shared/is-main.mjs';
 import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { ConnectionManager } from './connection.mjs';
@@ -135,8 +136,7 @@ export async function main(argv = process.argv.slice(2)) {
 }
 
 // 作为脚本直接运行时才启动（被 import 时不执行）
-const invoked = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
-if (invoked) {
+if (isMain(import.meta.url)) {
   main().then((code) => process.exit(code)).catch((err) => {
     console.error(`[agentdesk-service] fatal: ${err.message}`);
     process.exit(1);

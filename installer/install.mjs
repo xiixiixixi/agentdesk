@@ -18,7 +18,8 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import crypto from 'node:crypto';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
+import { isMain } from '../shared/is-main.mjs';
 
 // ---------------------------------------------------------------------------
 // 常量与家族表
@@ -523,16 +524,7 @@ async function main() {
   }
 }
 
-const isMain = () => {
-  if (!process.argv[1]) return false;
-  try {
-    return pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
-  } catch {
-    return false;
-  }
-};
-
-if (isMain()) {
+if (isMain(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`install: ${error instanceof Error ? error.message : String(error)}\n`);
     process.exit(2);

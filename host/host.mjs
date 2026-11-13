@@ -15,9 +15,10 @@
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { PROTOCOL_VERSION } from '../shared/protocol.mjs';
+import { isMain } from '../shared/is-main.mjs';
 
 export const HOST_VERSION = '0.1.0';
 
@@ -303,16 +304,7 @@ export async function main() {
 }
 
 // 仅作为主模块执行时启动（被测试 import 时只暴露纯函数）。
-const isMain = () => {
-  if (!process.argv[1]) return false;
-  try {
-    return pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
-  } catch {
-    return false;
-  }
-};
-
-if (isMain()) {
+if (isMain(import.meta.url)) {
   main().catch((error) => {
     log(`[host] fatal: ${error?.stack ?? error}`);
     process.exit(1);

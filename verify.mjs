@@ -18,8 +18,9 @@
 
 import process from 'node:process';
 import { readFileSync } from 'node:fs';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import { isMain } from './shared/is-main.mjs';
 
 import { ConnectionManager } from './service/connection.mjs';
 import { RemoteFrontend } from './service/remote-frontend.mjs';
@@ -370,8 +371,7 @@ export async function main(argv = process.argv.slice(2)) {
 }
 
 // 作为脚本直接运行时才启动（被 import 时不执行，供 test/verify.test.mjs 引纯逻辑）
-const invoked = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
-if (invoked) {
+if (isMain(import.meta.url)) {
   main().then((code) => process.exit(code)).catch((err) => {
     console.error(`[verify] fatal: ${err.message}`);
     process.exit(1);
